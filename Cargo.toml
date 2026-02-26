@@ -1,0 +1,28 @@
+[package]
+name = "typedown"
+version = "0.0.0-dev"
+edition = "2021"
+
+[[bin]]
+name = "td"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+git2 = "0.18"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+gray_matter = "0.2"
+indexmap = { version = "2", features = ["serde"] }
+pulldown-cmark = "0.12"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+lsp-server = "0.7"
+lsp-types = "0.97"
+globset = "0.4"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"

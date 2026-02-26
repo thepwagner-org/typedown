@@ -1,0 +1,215 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/pwagner/typedown/schema.json",
+  "title": "Typedown Schema",
+  "description": "Schema for typedown document type definitions (.typedown/*.yaml). The filename stem is the type name; documents declare 'type: <name>' in frontmatter or are matched by path patterns.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of this document type. Documentation only — ignored by the engine."
+    },
+    "paths": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Glob patterns for files this schema applies to, relative to the .typedown/ parent directory. When a file matches and has no 'type:' frontmatter, this schema applies automatically. Supports *, **, ?. Example: '**/AGENTS.md', '.claude/commands/*.md'."
+    },
+    "fields": {
+      "type": "object",
+      "description": "Typed frontmatter field definitions. Keys are frontmatter field names. Use for type validation and enum constraint checking.",
+      "additionalProperties": { "$ref": "#/$defs/field_def" }
+    },
+    "structure": { "$ref": "#/$defs/structure_def" }
+  },
+  "$defs": {
+    "field_def": {
+      "type": "object",
+      "description": "Definition of a typed frontmatter field.",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["string", "date", "datetime", "integer", "bool", "enum", "link", "list"],
+          "description": "Field type. 'date' expects YYYY-MM-DD; 'datetime' expects YYYY-MM-DD HH:MM; 'link' expects a relative path; 'enum' requires 'values'; 'list' requires 'item_type'."
+        },
+        "required": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether this field must be present in the document's frontmatter."
+        },
+        "values": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Allowed values. Required when type is 'enum'. Also required when type is 'list' and item_type is 'enum'."
+        },
+        "item_type": {
+          "type": "string",
+          "enum": ["string", "date", "datetime", "integer", "bool", "enum", "link"],
+          "description": "Element type for list fields. Required when type is 'list'. Nested lists are not supported."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "enum" } }, "required": ["type"] },
+          "then": { "required": ["values"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "list" } }, "required": ["type"] },
+          "then": { "required": ["item_type"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "list" }, "item_type": { "const": "enum" } },
+            "required": ["type", "item_type"]
+          },
+          "then": { "required": ["values"] }
+        }
+      ]
+    },
+    "structure_def": {
+      "type": "object",
+      "description": "Document structure rules.",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "H1 title validation mode. Named modes: 'none' (no validation, default), 'from_filename' (H1 must match filename stem), 'from_directory' (H1 must match parent directory name), 'from_project' (H1 must match project name or frontmatter 'name' field), 'from_date' (H1 derived from YYYY-MM filename, e.g. '2026-02.md' → 'February 2026'), 'required' (H1 must exist). Any other string is treated as fixed text — auto-created if missing."
+        },
+        "frontmatter": {
+          "type": "array",
+          "description": "Ordered list of frontmatter fields for serialization order and presence checks. For type/value validation use 'fields' instead.",
+          "items": { "$ref": "#/$defs/frontmatter_field_def" }
+        },
+        "intro": {
+          "$ref": "#/$defs/section_def",
+          "description": "Content between H1 and the first H2. The section's 'title' field is unused here."
+        },
+        "sections": {
+          "type": "array",
+          "description": "H2 section definitions. When strict_sections is true (default), order is enforced and unlisted sections are rejected.",
+          "items": { "$ref": "#/$defs/section_def" }
+        },
+        "strict_sections": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true (default), sections must appear in schema-defined order and unlisted H2s are rejected. Set false to allow freeform sections."
+        },
+        "validate_all_links": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true (default), all links in the document are checked for existence."
+        },
+        "size_warning": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Emit a warning if the file exceeds this many bytes. Useful for documents that should stay concise (e.g. AGENTS.md)."
+        },
+        "date_headings": {
+          "$ref": "#/$defs/date_headings_def",
+          "description": "Date-based H2 heading validation. When set, every H2 must be a date (YYYY-MM-DD or YYYY-MM-DD HH:MM). Mutually exclusive with 'sections'."
+        }
+      }
+    },
+    "section_def": {
+      "type": "object",
+      "description": "Definition of a document section (H2 heading and its content).",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Exact H2 heading text. Must match the markdown heading exactly. Unused for 'intro'."
+        },
+        "paragraph": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow paragraph (prose) content. Default false means bullet lists are required."
+        },
+        "required": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether this section must be present in the document."
+        },
+        "template": {
+          "type": "string",
+          "description": "Expected format for list items, validated against each bullet. Recognises '[text](url)' as a link placeholder, 'YYYY-MM-DD' as a date placeholder, and free text otherwise."
+        },
+        "links": { "$ref": "#/$defs/links_def" },
+        "managed_content": { "$ref": "#/$defs/managed_content" },
+        "intro_text": {
+          "type": "string",
+          "description": "Required introductory paragraph prefix for this section. Auto-inserted by 'td fmt' if missing."
+        }
+      }
+    },
+    "links_def": {
+      "type": "object",
+      "description": "Link constraints for a section.",
+      "additionalProperties": false,
+      "properties": {
+        "target_type": {
+          "type": "string",
+          "description": "Links in this section must point to documents of this schema type (the filename stem of a .typedown/*.yaml file)."
+        },
+        "bidirectional": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, linked documents must also link back to this document."
+        }
+      }
+    },
+    "managed_content": {
+      "type": "object",
+      "description": "Auto-managed section content. The validator checks the section matches the template and 'td fmt' rewrites it. Content appended after the template is preserved.",
+      "required": ["template"],
+      "additionalProperties": false,
+      "properties": {
+        "template": {
+          "type": "string",
+          "description": "Markdown template the section must start with. Include the H2 heading line."
+        },
+        "migrate_from": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Legacy section titles to automatically rename to this section's title."
+        }
+      }
+    },
+    "date_headings_def": {
+      "type": "object",
+      "description": "Configuration for date-based H2 headings (journals, changelogs, meeting notes).",
+      "additionalProperties": false,
+      "properties": {
+        "sort": {
+          "type": "string",
+          "enum": ["newest_first", "oldest_first"],
+          "default": "newest_first",
+          "description": "Sort order for date entries. 'newest_first' (default) is reverse chronological. 'oldest_first' is chronological (e.g. changelogs)."
+        }
+      }
+    },
+    "frontmatter_field_def": {
+      "type": "object",
+      "description": "A frontmatter field declaration for serialization ordering and presence checks. For type/value validation use the top-level 'fields' map.",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Frontmatter field key."
+        },
+        "required": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether this field must be present in the document's frontmatter."
+        },
+        "description": {
+          "type": "string",
+          "description": "Documentation for this field. Ignored by the engine; useful as LLM guidance."
+        }
+      }
+    }
+  }
+}

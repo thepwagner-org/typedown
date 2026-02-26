@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=../schema.json
+description: Monthly journal file. H1 derived from filename; H2s are date entries sorted newest first.
+paths:
+  - "journal/*.md"
+
+structure:
+  title: from_date
+  validate_all_links: true
+  date_headings:
+    sort: newest_first
