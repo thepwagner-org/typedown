@@ -23,6 +23,11 @@ pub fn presets_dir() -> Option<PathBuf> {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             PathBuf::from(home).join(".config")
         });
+    presets_dir_under(&config_home)
+}
+
+/// Return the presets directory under a given config home, if it exists.
+fn presets_dir_under(config_home: &Path) -> Option<PathBuf> {
     let dir = config_home.join("typedown").join("presets");
     if dir.is_dir() {
         Some(dir)
@@ -1069,21 +1074,14 @@ structure:
         let presets = dir.path().join("typedown/presets");
         fs::create_dir_all(&presets).unwrap();
 
-        std::env::set_var("XDG_CONFIG_HOME", dir.path());
-        let result = presets_dir();
-        std::env::remove_var("XDG_CONFIG_HOME");
-
+        let result = presets_dir_under(dir.path());
         assert_eq!(result, Some(presets));
     }
 
     #[test]
     fn test_presets_dir_returns_none_when_missing() {
         let dir = TempDir::new().unwrap();
-        // Point to a dir with no typedown/presets inside it
-        std::env::set_var("XDG_CONFIG_HOME", dir.path());
-        let result = presets_dir();
-        std::env::remove_var("XDG_CONFIG_HOME");
-
+        let result = presets_dir_under(dir.path());
         assert_eq!(result, None);
     }
 
@@ -1098,11 +1096,7 @@ structure:
         )
         .unwrap();
 
-        std::env::set_var("XDG_CONFIG_HOME", dir.path());
-        let schema = load_presets();
-        std::env::remove_var("XDG_CONFIG_HOME");
-
-        let schema = schema.expect("should load presets");
+        let schema = Schema::load(&presets).expect("should load presets");
         assert!(schema.get_type("readme").is_some());
     }
 }
