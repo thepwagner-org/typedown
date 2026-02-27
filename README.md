@@ -14,6 +14,7 @@ td lsp              # start language server (LSP over stdio)
 ## How It Works
 
 Create `.typedown/recipe.yaml`:
+
 ```yaml
 description: A recipe document
 fields:
@@ -26,7 +27,9 @@ fields:
   source:
     type: link
 ```
+
 Write `pasta.md`:
+
 ```markdown
 ---
 type: recipe
@@ -35,6 +38,7 @@ cuisine: italian
 ---
 # Pasta
 ```
+
 Run `td fmt` and typedown validates the frontmatter fields, checks required sections, verifies links exist, and formats the markdown.
 
 ## Features

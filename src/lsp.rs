@@ -91,8 +91,7 @@ fn validate_and_publish(
     file_path: &Path,
     published_files: &mut HashSet<PathBuf>,
 ) -> Result<()> {
-    let root = format::find_project_root(file_path)
-        .context("file is not inside a typedown project (no .typedown/ found)")?;
+    let root = format::find_project_root(file_path).context("could not determine project root")?;
 
     let file_errors = format::check_dir(&root)?;
 

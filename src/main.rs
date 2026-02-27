@@ -11,9 +11,23 @@ mod validate;
 use std::path::PathBuf;
 
 use clap::Parser;
+use tracing_subscriber::EnvFilter;
 
 fn main() {
     let cli = cli::Cli::parse();
+
+    let filter = if cli.debug {
+        EnvFilter::new("td=debug")
+    } else {
+        EnvFilter::from_default_env()
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .without_time()
+        .with_writer(std::io::stderr)
+        .init();
+
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     match cli.command {
@@ -61,20 +75,6 @@ fn main() {
                 std::process::exit(1);
             }
         },
-
-        cli::Command::Init => {
-            let schema_dir = root.join(".typedown");
-            if schema_dir.exists() {
-                eprintln!(".typedown/ already exists");
-                std::process::exit(1);
-            }
-            if let Err(e) = std::fs::create_dir(&schema_dir) {
-                eprintln!("error creating .typedown/: {e}");
-                std::process::exit(1);
-            }
-            eprintln!("created .typedown/");
-            eprintln!("add YAML files to define document types, e.g. .typedown/note.yaml");
-        }
 
         cli::Command::Lsp => {
             if let Err(e) = lsp::run() {

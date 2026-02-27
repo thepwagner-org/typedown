@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use tracing::debug;
 use walkdir::WalkDir;
 
 use crate::{
@@ -58,10 +59,12 @@ pub fn format_dir(root: &Path, opts: FormatOptions) -> Result<FormatResult> {
 
     // Pre-load schemas: schema_dir → Schema, and build path matchers.
     let (schemas, matchers) = load_all_schemas(root, &mut result);
+    debug!(schema_dirs = schemas.len(), "loaded schemas");
 
     // Pre-load linked-doc info for bidirectional link validation.
     // Key: absolute path → LinkedDocInfo
     let linked_docs = preload_linked_docs(root, &schemas, &matchers);
+    debug!(linked_docs = linked_docs.len(), "preloaded linked docs");
 
     // Pre-load git-tracked paths for cross-project link validation.
     let git_tree = crate::git::list_git_paths(root);
@@ -114,7 +117,9 @@ pub fn format_dir(root: &Path, opts: FormatOptions) -> Result<FormatResult> {
 pub fn check_dir(root: &Path) -> Result<Vec<FileError>> {
     let mut result = FormatResult::default();
     let (schemas, matchers) = load_all_schemas(root, &mut result);
+    debug!(schema_dirs = schemas.len(), "loaded schemas");
     let linked_docs = preload_linked_docs(root, &schemas, &matchers);
+    debug!(linked_docs = linked_docs.len(), "preloaded linked docs");
     let git_tree = crate::git::list_git_paths(root);
 
     let mut file_errors: Vec<FileError> = result.errors; // schema load errors
@@ -165,7 +170,9 @@ fn format_file(
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     let file_size = content.len();
+    let rel = path.strip_prefix(root).unwrap_or(path);
     let Some((schema, schema_dir)) = find_schema_for(path, root, schemas) else {
+        debug!(file = %rel.display(), "no schema covers file, skipping");
         return Ok(None);
     };
 
@@ -173,6 +180,23 @@ fn format_file(
 
     // Resolve type: explicit frontmatter `type:` takes priority, then path patterns.
     let resolved = resolve_type(path, &doc, schema, &schema_dir, matchers);
+    match &resolved {
+        ResolvedType::Explicit(name, _) => {
+            debug!(file = %rel.display(), r#type = name, "explicit type from frontmatter");
+        }
+        ResolvedType::PathMatched(name, _) => {
+            debug!(file = %rel.display(), r#type = name, "type matched by path pattern");
+        }
+        ResolvedType::OptedOut => {
+            debug!(file = %rel.display(), "type: none, opted out");
+        }
+        ResolvedType::Conflict(types) => {
+            debug!(file = %rel.display(), ?types, "conflicting path matches");
+        }
+        ResolvedType::Unknown => {
+            debug!(file = %rel.display(), "no type resolved");
+        }
+    }
 
     let docs_slice: Vec<&LinkedDocInfo> = linked_docs.values().collect();
     let docs_owned: Vec<LinkedDocInfo> = docs_slice.into_iter().cloned().collect();
@@ -231,9 +255,14 @@ fn format_file(
         suppress_missing_frontmatter(&mut diagnostics, &resolved);
     }
 
+    if !diagnostics.is_empty() {
+        debug!(file = %rel.display(), count = diagnostics.len(), "diagnostics found");
+    }
+
     // Don't auto-fix if there are unfixable diagnostics
     let has_unfixable = diagnostics.iter().any(|d| !crate::fix::Fix::is_fixable(d));
     if has_unfixable {
+        debug!(file = %rel.display(), "has unfixable diagnostics, skipping write");
         return Ok(Some(false));
     }
 
@@ -266,11 +295,15 @@ fn format_file(
     };
 
     if formatted == content {
+        debug!(file = %rel.display(), "unchanged");
         return Ok(Some(false));
     }
 
     if !opts.check {
+        debug!(file = %rel.display(), "formatted (written)");
         std::fs::write(path, &formatted).with_context(|| format!("writing {}", path.display()))?;
+    } else {
+        debug!(file = %rel.display(), "would change (check mode)");
     }
 
     Ok(Some(true))
@@ -292,14 +325,33 @@ fn check_file(
         }];
     };
 
+    let rel = path.strip_prefix(root).unwrap_or(path);
     let file_size = content.len();
     let Some((schema, schema_dir)) = find_schema_for(path, root, schemas) else {
+        debug!(file = %rel.display(), "no schema covers file, skipping");
         return vec![];
     };
 
     let doc = parse(&content);
 
     let resolved = resolve_type(path, &doc, schema, &schema_dir, matchers);
+    match &resolved {
+        ResolvedType::Explicit(name, _) => {
+            debug!(file = %rel.display(), r#type = name, "explicit type from frontmatter");
+        }
+        ResolvedType::PathMatched(name, _) => {
+            debug!(file = %rel.display(), r#type = name, "type matched by path pattern");
+        }
+        ResolvedType::OptedOut => {
+            debug!(file = %rel.display(), "type: none, opted out");
+        }
+        ResolvedType::Conflict(types) => {
+            debug!(file = %rel.display(), ?types, "conflicting path matches");
+        }
+        ResolvedType::Unknown => {
+            debug!(file = %rel.display(), "no type resolved");
+        }
+    }
 
     let docs_owned: Vec<LinkedDocInfo> = linked_docs.values().cloned().collect();
 
@@ -356,6 +408,9 @@ fn load_all_schemas(
     let mut schemas: HashMap<PathBuf, Schema> = HashMap::new();
     let mut matchers: HashMap<PathBuf, PathMatcher> = HashMap::new();
     let presets = schema::load_presets();
+    if let Some(ref p) = presets {
+        debug!(types = p.types.len(), "loaded presets");
+    }
 
     let walker = WalkDir::new(root)
         .into_iter()
@@ -369,10 +424,17 @@ fn load_all_schemas(
             }
             match Schema::load(path) {
                 Ok(mut schema) => {
+                    let local_types: Vec<&str> = schema.types.keys().map(|s| s.as_str()).collect();
+                    debug!(
+                        dir = %path.display(),
+                        ?local_types,
+                        "found schema directory"
+                    );
                     // Merge presets: fill in types not defined locally.
                     if let Some(ref presets) = presets {
                         for (name, type_def) in &presets.types {
                             if !schema.types.contains_key(name) {
+                                debug!(name, "merged preset type");
                                 schema.types.insert(name.clone(), type_def.clone());
                             }
                         }
@@ -404,6 +466,30 @@ fn load_all_schemas(
                     });
                 }
             }
+        }
+    }
+
+    // If no .typedown/ dirs found but presets exist, create a virtual
+    // root-level schema so preset path patterns can anchor against root.
+    if schemas.is_empty() {
+        if let Some(presets) = presets {
+            debug!("no .typedown/ dir found; activating presets at root");
+            let virtual_dir = root.join(SCHEMA_DIR);
+            match presets.build_path_matcher() {
+                Ok(matcher) => {
+                    matchers.insert(virtual_dir.clone(), matcher);
+                }
+                Err(e) => {
+                    result.errors.push(FileError {
+                        path: virtual_dir.clone(),
+                        diagnostics: vec![Diagnostic::UnknownType {
+                            line: 0,
+                            message: format!("path pattern error: {e}"),
+                        }],
+                    });
+                }
+            }
+            schemas.insert(virtual_dir, presets);
         }
     }
 
@@ -663,18 +749,27 @@ fn suppress_missing_frontmatter(diagnostics: &mut Vec<Diagnostic>, resolved: &Re
 ///
 /// Returns the parent of `.typedown/`, not the `.typedown/` dir itself.
 /// Used by the LSP to determine the project root from a file path.
+///
+/// Falls back to `start`'s directory when no `.typedown/` is found, so
+/// preset-only projects still get a usable root.
 pub(crate) fn find_project_root(start: &Path) -> Option<PathBuf> {
-    let mut dir = if start.is_file() {
+    let start_dir = if start.is_file() {
         start.parent()?
     } else {
         start
     };
+    let mut dir = start_dir;
     loop {
         if dir.join(SCHEMA_DIR).is_dir() {
             return Some(dir.to_path_buf());
         }
-        dir = dir.parent()?;
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break,
+        }
     }
+    // Fallback: use start directory for preset-only projects.
+    Some(start_dir.to_path_buf())
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -709,8 +804,12 @@ mod tests {
 
     #[test]
     fn test_format_dir_no_schema_no_changes() {
+        // Isolate from real XDG presets on the developer's machine.
+        let xdg_dir = TempDir::new().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
         let dir = make_tree(&[("notes/hello.md", "# Hello\n\nJust a note.\n")]);
         let result = format_dir(dir.path(), FormatOptions::default()).unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
         assert_eq!(result.files_changed, 0);
         assert!(result.errors.is_empty());
     }
@@ -784,8 +883,12 @@ mod tests {
 
     #[test]
     fn test_check_dir_no_schema_no_errors() {
+        // Isolate from real XDG presets on the developer's machine.
+        let xdg_dir = TempDir::new().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
         let dir = make_tree(&[("notes/hello.md", "# Hello\n")]);
         let errors = check_dir(dir.path()).unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
         assert!(errors.is_empty());
     }
 
@@ -1184,8 +1287,9 @@ mod tests {
     }
 
     #[test]
-    fn test_presets_ignored_without_local_schema_dir() {
-        // XDG presets exist but project has no .typedown/ dir
+    fn test_presets_apply_without_local_schema_dir() {
+        // XDG presets exist but project has no .typedown/ dir — presets
+        // should still activate via a virtual root schema.
         let xdg_dir = TempDir::new().unwrap();
         let presets = xdg_dir.path().join("typedown/presets");
         fs::create_dir_all(&presets).unwrap();
@@ -1202,10 +1306,10 @@ mod tests {
         let errors = check_dir(dir.path()).unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
 
-        // No .typedown/ dir → no validation at all, even with presets
+        // Presets should validate: README.md is missing required `created` field
         assert!(
-            errors.is_empty(),
-            "presets should not apply without a .typedown/ dir, got: {errors:?}"
+            !errors.is_empty(),
+            "presets should apply without a .typedown/ dir"
         );
     }
 }
