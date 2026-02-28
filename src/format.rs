@@ -982,7 +982,7 @@ mod tests {
         assert_idempotent(&[
             (
                 ".typedown/doc.yaml",
-                "structure:\n  sections:\n    - title: Goals\n      intro_text: 'Explicitly:'\n      paragraph: true\n",
+                "structure:\n  sections:\n    - title: Goals\n      intro_text: 'Explicitly:'\n",
             ),
             (
                 "doc.md",
@@ -1008,9 +1008,37 @@ mod tests {
         assert_idempotent(&[
             (
                 ".typedown/doc.yaml",
-                "structure:\n  sections:\n    - title: Notes\n      required: false\n      paragraph: true\n",
+                "structure:\n  sections:\n    - title: Notes\n      required: false\n",
             ),
             ("doc.md", "---\ntype: doc\n---\n# Doc\n\n## Notes\n"),
+        ]);
+    }
+
+    #[test]
+    fn test_fix_paragraph_to_bullet_idempotent() {
+        assert_idempotent(&[
+            (
+                ".typedown/doc.yaml",
+                "structure:\n  sections:\n    - title: Goals\n      bullets: any\n",
+            ),
+            (
+                "doc.md",
+                "---\ntype: doc\n---\n# Doc\n\n## Goals\n\nThis is a paragraph.\n",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn test_fix_list_type_conversion_idempotent() {
+        assert_idempotent(&[
+            (
+                ".typedown/doc.yaml",
+                "structure:\n  sections:\n    - title: Steps\n      bullets: ordered\n",
+            ),
+            (
+                "doc.md",
+                "---\ntype: doc\n---\n# Doc\n\n## Steps\n\n- First\n- Second\n",
+            ),
         ]);
     }
 

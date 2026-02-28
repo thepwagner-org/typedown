@@ -9,8 +9,9 @@ use crate::{
     ast::{inlines_to_markdown, inlines_to_string, Block, Document, Frontmatter, Inline, ListItem},
     parse::parse,
     schema::{
-        matches_template, parse_template, DateHeadingsDef, FieldDef, FieldType, HeadingSort,
-        LinksDef, ManagedContent, Schema, SectionDef, StructureDef, TitleMode, TypeDef,
+        matches_template, parse_template, BulletMode, DateHeadingsDef, FieldDef, FieldType,
+        HeadingSort, LinksDef, ManagedContent, Schema, SectionDef, StructureDef, TitleMode,
+        TypeDef,
     },
 };
 
@@ -55,6 +56,12 @@ pub enum Diagnostic {
     SectionOutOfOrder { line: usize, section: String },
     /// A section contains non-bullet content where only bullets are expected.
     SectionNotBullets { line: usize, context: String },
+    /// A list in a section has the wrong type (ordered vs unordered).
+    WrongListType {
+        line: usize,
+        context: String,
+        expected: String,
+    },
     /// A list item doesn't match the section's template.
     TemplateMismatch {
         line: usize,
@@ -167,6 +174,11 @@ impl Diagnostic {
             Self::SectionNotBullets { context, .. } => {
                 format!("{context}: only bullet lists are allowed here")
             }
+            Self::WrongListType {
+                context, expected, ..
+            } => {
+                format!("{context}: expected {expected} list")
+            }
             Self::TemplateMismatch {
                 section, template, ..
             } => {
@@ -235,6 +247,7 @@ impl Diagnostic {
             | Self::UnexpectedSection { line, .. }
             | Self::SectionOutOfOrder { line, .. }
             | Self::SectionNotBullets { line, .. }
+            | Self::WrongListType { line, .. }
             | Self::TemplateMismatch { line, .. }
             | Self::SectionNeedsIntro {
                 insert_after_line: line,
@@ -958,18 +971,41 @@ fn validate_intro_content(doc: &Document, intro_def: &SectionDef, out: &mut Vec<
     let end = first_h2_pos.unwrap_or(doc.blocks.len());
     let intro_blocks = &doc.blocks[start + 1..end];
 
-    if intro_def.paragraph {
-        return; // paragraphs allowed
+    if let Some(mode) = intro_def.effective_bullet_mode() {
+        validate_bullets_only(intro_blocks, "intro", mode, out);
     }
-
-    validate_bullets_only(intro_blocks, "intro", out);
 }
 
-/// Validate that all blocks in a slice are bullet lists (or blank lines).
-fn validate_bullets_only(blocks: &[Block], context: &str, out: &mut Vec<Diagnostic>) {
+/// Validate that all blocks in a slice are bullet lists (or blank lines),
+/// and that each list matches the expected [`BulletMode`].
+fn validate_bullets_only(
+    blocks: &[Block],
+    context: &str,
+    mode: BulletMode,
+    out: &mut Vec<Diagnostic>,
+) {
     for block in blocks {
         match block {
-            Block::List { .. } | Block::BlankLine => {}
+            Block::List { ordered, line, .. } => {
+                let ok = match mode {
+                    BulletMode::Any => true,
+                    BulletMode::Ordered => *ordered,
+                    BulletMode::Unordered => !*ordered,
+                };
+                if !ok {
+                    let expected = match mode {
+                        BulletMode::Ordered => "ordered",
+                        BulletMode::Unordered => "unordered",
+                        BulletMode::Any => unreachable!(),
+                    };
+                    out.push(Diagnostic::WrongListType {
+                        line: *line,
+                        context: context.to_string(),
+                        expected: expected.to_string(),
+                    });
+                }
+            }
+            Block::BlankLine => {}
             other => {
                 out.push(Diagnostic::SectionNotBullets {
                     line: other.line(),
@@ -1118,38 +1154,36 @@ fn validate_section_content(
             continue;
         }
 
-        // Paragraphs allowed → skip bullet/template checks
-        if section_def.paragraph {
-            // Still validate links if configured
-            if let Some(ref links_def) = section_def.links {
-                validate_section_links(section_blocks, *heading_line, links_def, ctx, out);
-            }
-            continue;
-        }
+        // Bullets mode: explicit `bullets:` or implied by `template:`
+        if let Some(mode) = section_def.effective_bullet_mode() {
+            validate_bullets_only(
+                section_blocks,
+                &format!("section '{section_title}'"),
+                mode,
+                out,
+            );
 
-        // Bullets only
-        validate_bullets_only(section_blocks, &format!("section '{section_title}'"), out);
-
-        // Template matching
-        if let Some(ref template) = section_def.template {
-            let segments = parse_template(template);
-            for block in section_blocks {
-                if let Block::List { items, .. } = block {
-                    for item in items {
-                        validate_item_template(
-                            item,
-                            *heading_line,
-                            section_title,
-                            template,
-                            &segments,
-                            out,
-                        );
+            // Template matching
+            if let Some(ref template) = section_def.template {
+                let segments = parse_template(template);
+                for block in section_blocks {
+                    if let Block::List { items, .. } = block {
+                        for item in items {
+                            validate_item_template(
+                                item,
+                                *heading_line,
+                                section_title,
+                                template,
+                                &segments,
+                                out,
+                            );
+                        }
                     }
                 }
             }
         }
 
-        // Link constraints
+        // Link constraints (always checked, regardless of content mode)
         if let Some(ref links_def) = section_def.links {
             validate_section_links(section_blocks, *heading_line, links_def, ctx, out);
         }
@@ -1944,13 +1978,14 @@ structure:
 
     #[test]
     fn test_section_not_bullets() {
+        // Section with `bullets: any` rejects paragraph content
         let yaml = r"
 structure:
   sections:
     - title: Goals
+      bullets: any
 ";
         let (schema, type_def) = make_schema("t", yaml);
-        // Goals section contains a paragraph, not a bullet
         let doc = parse("---\ntype: t\n---\n## Goals\n\nThis is a paragraph.\n");
         let diags = validate(
             &doc,
@@ -1967,12 +2002,12 @@ structure:
     }
 
     #[test]
-    fn test_section_paragraph_allowed() {
+    fn test_section_paragraph_allowed_by_default() {
+        // Sections without `bullets:` allow any content (paragraphs are the default)
         let yaml = r"
 structure:
   sections:
     - title: Notes
-      paragraph: true
 ";
         let (schema, type_def) = make_schema("t", yaml);
         let doc = parse("---\ntype: t\n---\n## Notes\n\nFree text here.\n");
@@ -1983,6 +2018,105 @@ structure:
             None,
         );
         assert!(diags.is_empty(), "got: {diags:?}");
+    }
+
+    #[test]
+    fn test_section_bullets_unordered_rejects_ordered() {
+        let yaml = r"
+structure:
+  sections:
+    - title: Items
+      bullets: unordered
+";
+        let (schema, type_def) = make_schema("t", yaml);
+        let doc = parse("---\ntype: t\n---\n## Items\n\n1. First\n2. Second\n");
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("t", empty_path(), &schema, &[]),
+            None,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| matches!(d, Diagnostic::WrongListType { .. })),
+            "expected WrongListType, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_section_bullets_ordered_rejects_unordered() {
+        let yaml = r"
+structure:
+  sections:
+    - title: Steps
+      bullets: ordered
+";
+        let (schema, type_def) = make_schema("t", yaml);
+        let doc = parse("---\ntype: t\n---\n## Steps\n\n- First\n- Second\n");
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("t", empty_path(), &schema, &[]),
+            None,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| matches!(d, Diagnostic::WrongListType { .. })),
+            "expected WrongListType, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_section_bullets_any_accepts_both() {
+        let yaml = r"
+structure:
+  strict_sections: false
+  sections:
+    - title: Mixed
+      bullets: any
+";
+        let (schema, type_def) = make_schema("t", yaml);
+        let doc = parse("---\ntype: t\n---\n## Mixed\n\n- Unordered item\n\n1. Ordered item\n");
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("t", empty_path(), &schema, &[]),
+            None,
+        );
+        assert!(
+            !diags.iter().any(|d| matches!(
+                d,
+                Diagnostic::SectionNotBullets { .. } | Diagnostic::WrongListType { .. }
+            )),
+            "got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_template_implies_bullets_mode() {
+        // A section with only `template:` should enforce bullets mode
+        let yaml = r#"
+structure:
+  sections:
+    - title: Features
+      template: "- **Text**: Text"
+"#;
+        let (schema, type_def) = make_schema("t", yaml);
+        let doc = parse("---\ntype: t\n---\n## Features\n\nThis is a paragraph.\n");
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("t", empty_path(), &schema, &[]),
+            None,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| matches!(d, Diagnostic::SectionNotBullets { .. })),
+            "template should imply bullets mode, got: {diags:?}"
+        );
     }
 
     #[test]
@@ -2345,8 +2479,7 @@ structure:
     #[test]
     fn test_empty_optional_section_detected() {
         // "Notes" is optional (required: false); it has no content
-        let yaml =
-            "structure:\n  sections:\n    - title: Notes\n      required: false\n      paragraph: true\n";
+        let yaml = "structure:\n  sections:\n    - title: Notes\n      required: false\n";
         let (schema, type_def) = make_schema("doc", yaml);
         let doc = parse("---\ntype: doc\n---\n# Title\n\n## Notes\n");
         let path = Path::new("test.md");
@@ -2361,8 +2494,7 @@ structure:
 
     #[test]
     fn test_non_empty_optional_section_not_flagged() {
-        let yaml =
-            "structure:\n  sections:\n    - title: Notes\n      required: false\n      paragraph: true\n";
+        let yaml = "structure:\n  sections:\n    - title: Notes\n      required: false\n";
         let (schema, type_def) = make_schema("doc", yaml);
         let doc = parse("---\ntype: doc\n---\n# Title\n\n## Notes\n\nSome content here.\n");
         let path = Path::new("test.md");
@@ -2378,8 +2510,7 @@ structure:
     #[test]
     fn test_required_empty_section_not_flagged_for_removal() {
         // "Goals" is required: true — empty but must not be auto-removed
-        let yaml =
-            "structure:\n  sections:\n    - title: Goals\n      required: true\n      paragraph: true\n";
+        let yaml = "structure:\n  sections:\n    - title: Goals\n      required: true\n";
         let (schema, type_def) = make_schema("doc", yaml);
         let doc = parse("---\ntype: doc\n---\n# Title\n\n## Goals\n");
         let path = Path::new("test.md");

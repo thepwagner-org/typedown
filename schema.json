@@ -122,10 +122,12 @@
           "type": "string",
           "description": "Exact H2 heading text. Must match the markdown heading exactly. Unused for 'intro'."
         },
-        "paragraph": {
-          "type": "boolean",
-          "default": false,
-          "description": "Allow paragraph (prose) content. Default false means bullet lists are required."
+        "bullets": {
+          "oneOf": [
+            { "type": "boolean", "const": true },
+            { "type": "string", "enum": ["any", "ordered", "unordered"] }
+          ],
+          "description": "Restrict content to bullet lists only. 'any' (or true) allows any list type; 'ordered' requires numbered lists; 'unordered' requires dash lists. Default: omitted (paragraphs and any content allowed). A 'template' field implicitly enables unordered bullet mode."
         },
         "required": {
           "type": "boolean",

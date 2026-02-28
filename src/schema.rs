@@ -316,6 +316,61 @@ pub enum HeadingSort {
     OldestFirst,
 }
 
+/// Bullet-list mode for a section.
+///
+/// Deserialized from YAML: `any`, `ordered`, `unordered`, or `true` (→ `Any`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulletMode {
+    /// Any list type (ordered or unordered).
+    Any,
+    /// Only ordered (numbered) lists.
+    Ordered,
+    /// Only unordered (dash/bullet) lists.
+    Unordered,
+}
+
+impl<'de> Deserialize<'de> for BulletMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+
+        struct BulletModeVisitor;
+
+        impl<'de> de::Visitor<'de> for BulletModeVisitor {
+            type Value = BulletMode;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("\"any\", \"ordered\", \"unordered\", or true")
+            }
+
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                if v {
+                    Ok(BulletMode::Any)
+                } else {
+                    Err(E::custom(
+                        "bullets: false is not valid; omit the field instead",
+                    ))
+                }
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    "any" => Ok(BulletMode::Any),
+                    "ordered" => Ok(BulletMode::Ordered),
+                    "unordered" => Ok(BulletMode::Unordered),
+                    other => Err(E::custom(format!(
+                        "unknown bullet mode '{other}'; expected any, ordered, or unordered"
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(BulletModeVisitor)
+    }
+}
+
 /// Definition of a document section.
 ///
 /// All fields are settable from YAML.
@@ -324,9 +379,12 @@ pub struct SectionDef {
     /// Section heading text (not used for `intro`).
     #[serde(default)]
     pub title: String,
-    /// Allow paragraph content (default: `false` → bullets required).
+    /// Restrict content to bullet lists only (default: `None` → any content allowed).
+    ///
+    /// `any` — any list type; `ordered` — numbered lists only; `unordered` — dash lists only.
+    /// `true` is accepted as shorthand for `any`.
     #[serde(default)]
-    pub paragraph: bool,
+    pub bullets: Option<BulletMode>,
     /// Whether this section is required.
     #[serde(default)]
     pub required: bool,
@@ -342,6 +400,32 @@ pub struct SectionDef {
     /// Required intro paragraph prefix; auto-inserted if missing.
     #[serde(default)]
     pub intro_text: Option<String>,
+}
+
+impl SectionDef {
+    /// Whether this section enforces bullets-only content.
+    ///
+    /// True when `bullets` is explicitly set, or when a `template` is present
+    /// (templates describe bullet item formats, so they imply bullet mode).
+    #[allow(dead_code)]
+    pub fn is_bullets_mode(&self) -> bool {
+        self.bullets.is_some() || self.template.is_some()
+    }
+
+    /// The effective bullet mode, resolving template-implied defaults.
+    ///
+    /// - Explicit `bullets` takes precedence.
+    /// - A `template` without `bullets` defaults to `Unordered`.
+    /// - Neither returns `None`.
+    pub fn effective_bullet_mode(&self) -> Option<BulletMode> {
+        self.bullets.or_else(|| {
+            if self.template.is_some() {
+                Some(BulletMode::Unordered)
+            } else {
+                None
+            }
+        })
+    }
 }
 
 /// Link constraints for a section.
@@ -429,6 +513,8 @@ pub enum TemplateSegment {
     Literal(String),
     /// A markdown link `[text](url)`.
     Link,
+    /// Bold text `**...**`.
+    Bold,
     /// A date `YYYY-MM-DD`.
     Date,
     /// Free text (matches any characters).
@@ -439,6 +525,7 @@ pub enum TemplateSegment {
 ///
 /// Recognises:
 /// - `[...](...)`  → `Link`
+/// - `**...**`     → `Bold`
 /// - `YYYY-MM-DD` or actual date → `Date`
 /// - Common separators (` - `, `, `, etc.) → `Literal`
 /// - Other spans → `Text`
@@ -453,6 +540,12 @@ pub fn parse_template(template: &str) -> Vec<TemplateSegment> {
                 remaining = &remaining[end..];
                 continue;
             }
+        }
+
+        if let Some(end) = match_bold_end(remaining) {
+            segments.push(TemplateSegment::Bold);
+            remaining = &remaining[end..];
+            continue;
         }
 
         if let Some(end) = match_date_pattern(remaining) {
@@ -498,6 +591,9 @@ fn matches_recursive(s: &str, segments: &[TemplateSegment]) -> bool {
         TemplateSegment::Link => {
             find_link_end(s).is_some_and(|end| matches_recursive(&s[end..], &segments[1..]))
         }
+        TemplateSegment::Bold => {
+            match_bold_end(s).is_some_and(|end| matches_recursive(&s[end..], &segments[1..]))
+        }
         TemplateSegment::Date => {
             match_date_pattern(s).is_some_and(|end| matches_recursive(&s[end..], &segments[1..]))
         }
@@ -533,6 +629,22 @@ fn find_link_end(s: &str) -> Option<usize> {
     None
 }
 
+/// Find the end of a bold span `**...**`, returning the byte offset past the
+/// closing `**`.  Returns `None` if `s` doesn't start with `**` or has no
+/// closing pair.
+fn match_bold_end(s: &str) -> Option<usize> {
+    if !s.starts_with("**") {
+        return None;
+    }
+    // Find closing ** after the opening one.
+    let inner = &s[2..];
+    let close = inner.find("**")?;
+    if close == 0 {
+        return None; // empty bold `****` is not valid
+    }
+    Some(2 + close + 2) // opening ** + inner + closing **
+}
+
 fn match_date_pattern(s: &str) -> Option<usize> {
     if s.starts_with("YYYY-MM-DD") {
         return Some(10);
@@ -557,7 +669,9 @@ fn match_date_pattern(s: &str) -> Option<usize> {
 }
 
 fn match_separator(s: &str) -> Option<usize> {
-    for sep in [" - ", ", ", "; ", ": ", " (", ") ", "(", ")", " – ", "–"] {
+    for sep in [
+        " - ", "- ", ", ", "; ", ": ", " (", ") ", "(", ")", " – ", "–",
+    ] {
         if s.starts_with(sep) {
             return Some(sep.len());
         }
@@ -568,6 +682,9 @@ fn match_separator(s: &str) -> Option<usize> {
 fn find_text_end(s: &str) -> usize {
     for (i, c) in s.char_indices() {
         if c == '[' {
+            return i;
+        }
+        if c == '*' && s[i..].starts_with("**") && match_bold_end(&s[i..]).is_some() {
             return i;
         }
         if matches!(c, '-' | ',' | ';' | ':' | '(' | ')') && match_separator(&s[i..]).is_some() {
@@ -716,7 +833,7 @@ structure:
   sections:
     - title: Notes
       required: false
-      paragraph: true
+      bullets: any
 "#;
         let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(td.structure.title, TitleMode::FromFilename);
@@ -726,6 +843,7 @@ structure:
         assert_eq!(td.fields.len(), 1);
         assert!(td.fields["category"].required);
         assert_eq!(td.structure.sections.len(), 1);
+        assert_eq!(td.structure.sections[0].bullets, Some(BulletMode::Any));
     }
 
     #[test]
@@ -735,7 +853,6 @@ structure:
   sections:
     - title: Related Documents
       required: true
-      paragraph: true
       managed_content:
         template: |
           ## Related Documents
@@ -760,7 +877,6 @@ structure:
   sections:
     - title: Non-Goals
       required: true
-      paragraph: true
       intro_text: "Explicitly out of scope to keep the project focused:"
 "#;
         let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
@@ -768,6 +884,62 @@ structure:
         assert_eq!(
             sec.intro_text.as_deref(),
             Some("Explicitly out of scope to keep the project focused:")
+        );
+    }
+
+    // ── BulletMode deserialization ────────────────────────────────────────────
+
+    #[test]
+    fn test_bullet_mode_string_values() {
+        let yaml = "structure:\n  sections:\n    - title: A\n      bullets: any\n    - title: B\n      bullets: ordered\n    - title: C\n      bullets: unordered\n";
+        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(td.structure.sections[0].bullets, Some(BulletMode::Any));
+        assert_eq!(td.structure.sections[1].bullets, Some(BulletMode::Ordered));
+        assert_eq!(
+            td.structure.sections[2].bullets,
+            Some(BulletMode::Unordered)
+        );
+    }
+
+    #[test]
+    fn test_bullet_mode_true_is_any() {
+        let yaml = "structure:\n  sections:\n    - title: A\n      bullets: true\n";
+        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(td.structure.sections[0].bullets, Some(BulletMode::Any));
+    }
+
+    #[test]
+    fn test_bullet_mode_false_rejected() {
+        let yaml = "structure:\n  sections:\n    - title: A\n      bullets: false\n";
+        let result: Result<TypeDef, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "bullets: false should be rejected");
+    }
+
+    #[test]
+    fn test_bullet_mode_omitted_is_none() {
+        let yaml = "structure:\n  sections:\n    - title: A\n";
+        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(td.structure.sections[0].bullets, None);
+    }
+
+    #[test]
+    fn test_is_bullets_mode_template_implies_bullets() {
+        let yaml = "structure:\n  sections:\n    - title: A\n      template: '- **Text**: Text'\n";
+        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
+        assert!(td.structure.sections[0].is_bullets_mode());
+        assert_eq!(
+            td.structure.sections[0].effective_bullet_mode(),
+            Some(BulletMode::Unordered)
+        );
+    }
+
+    #[test]
+    fn test_is_bullets_mode_explicit_overrides_template_default() {
+        let yaml = "structure:\n  sections:\n    - title: A\n      bullets: ordered\n      template: '- **Text**: Text'\n";
+        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            td.structure.sections[0].effective_bullet_mode(),
+            Some(BulletMode::Ordered)
         );
     }
 
@@ -905,6 +1077,43 @@ structure:
     fn test_matches_template_text() {
         let segs = parse_template("[link](url) - Text");
         assert!(matches_template("[foo](bar) - anything goes here", &segs));
+    }
+
+    #[test]
+    fn test_matches_template_bold() {
+        let segs = parse_template("- **Text** - Text");
+        assert!(matches_template(
+            "- **Field types** - string, date, integer",
+            &segs
+        ));
+        assert!(matches_template(
+            "- **LSP** - diagnostics on open and change",
+            &segs
+        ));
+        assert!(!matches_template("- no bold here - something", &segs));
+        assert!(!matches_template("- *italic* - not bold", &segs));
+    }
+
+    #[test]
+    fn test_matches_template_bold_no_separator() {
+        let segs = parse_template("**Text**");
+        assert!(matches_template("**hello**", &segs));
+        assert!(!matches_template("hello", &segs));
+        assert!(!matches_template("****", &segs)); // empty bold
+    }
+
+    #[test]
+    fn test_parse_template_bold_segments() {
+        let segs = parse_template("- **Text** - Text");
+        assert_eq!(
+            segs,
+            vec![
+                TemplateSegment::Literal("- ".to_string()),
+                TemplateSegment::Bold,
+                TemplateSegment::Literal(" - ".to_string()),
+                TemplateSegment::Text,
+            ]
+        );
     }
 
     #[test]

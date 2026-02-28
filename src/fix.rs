@@ -4,7 +4,7 @@
 //! problem. A fix operates on `&mut Document` and requires no I/O.
 
 use crate::{
-    ast::{Block, Document, Inline},
+    ast::{Block, Document, Inline, ListItem},
     validate::Diagnostic,
 };
 
@@ -46,6 +46,20 @@ pub enum Fix {
     /// pairs in document order.  The fix removes them in reverse to preserve
     /// earlier indices.
     RemoveEmptySections { section_ranges: Vec<(usize, usize)> },
+    /// Convert paragraph blocks to bullet list items in a bullets-only section.
+    ConvertParagraphsToBullets {
+        /// Block indices of `Block::Paragraph` to convert (in document order).
+        paragraph_indices: Vec<usize>,
+        /// Whether to produce ordered lists.
+        ordered: bool,
+    },
+    /// Flip a list's ordered/unordered flag.
+    ConvertListType {
+        /// Block index of the `Block::List` to convert.
+        list_index: usize,
+        /// Target: `true` for ordered, `false` for unordered.
+        ordered: bool,
+    },
 }
 
 impl Fix {
@@ -59,10 +73,16 @@ impl Fix {
                 | Diagnostic::SectionNeedsIntro { .. }
                 | Diagnostic::EntriesOutOfOrder { .. }
                 | Diagnostic::EmptyOptionalSection { .. }
+                | Diagnostic::SectionNotBullets { .. }
+                | Diagnostic::WrongListType { .. }
         )
     }
 
     /// Derive a fix from a diagnostic, if one exists.
+    ///
+    /// For [`Diagnostic::SectionNotBullets`] and [`Diagnostic::WrongListType`],
+    /// use [`build_content_fixes`] instead — those require document context
+    /// to locate the correct block indices.
     pub fn from_diagnostic(diag: &Diagnostic) -> Option<Self> {
         match diag {
             Diagnostic::MissingH1 { expected } => Some(Fix::InsertH1 {
@@ -99,6 +119,8 @@ impl Fix {
             Diagnostic::EmptyOptionalSection { section_ranges } => Some(Fix::RemoveEmptySections {
                 section_ranges: section_ranges.clone(),
             }),
+            // SectionNotBullets and WrongListType are handled by build_content_fixes
+            Diagnostic::SectionNotBullets { .. } | Diagnostic::WrongListType { .. } => None,
             _ => None,
         }
     }
@@ -217,8 +239,103 @@ impl Fix {
                     }
                 }
             }
+
+            Fix::ConvertParagraphsToBullets {
+                paragraph_indices,
+                ordered,
+            } => {
+                // Convert in reverse order to preserve earlier indices.
+                let mut indices = paragraph_indices.clone();
+                indices.sort_unstable();
+                for idx in indices.into_iter().rev() {
+                    if idx >= doc.blocks.len() {
+                        continue;
+                    }
+                    if let Block::Paragraph { content, line } = &doc.blocks[idx] {
+                        let item = ListItem {
+                            content: content.clone(),
+                            children: vec![],
+                        };
+                        doc.blocks[idx] = Block::List {
+                            items: vec![item],
+                            ordered: *ordered,
+                            line: *line,
+                        };
+                    }
+                }
+            }
+
+            Fix::ConvertListType {
+                list_index,
+                ordered,
+            } => {
+                if let Some(Block::List {
+                    ordered: current, ..
+                }) = doc.blocks.get_mut(*list_index)
+                {
+                    *current = *ordered;
+                }
+            }
         }
     }
+}
+
+// ── Content fixes (paragraph ↔ bullet conversion) ────────────────────────────
+
+/// Build fixes for `SectionNotBullets` and `WrongListType` diagnostics.
+///
+/// These diagnostics carry only a line number, so we need to scan the document
+/// to find the block indices of the offending blocks.
+pub fn build_content_fixes(doc: &Document, diagnostics: &[Diagnostic]) -> Vec<Fix> {
+    let mut fixes = Vec::new();
+
+    // Group SectionNotBullets by line → collect paragraph block indices
+    let not_bullets_lines: std::collections::HashSet<usize> = diagnostics
+        .iter()
+        .filter_map(|d| match d {
+            Diagnostic::SectionNotBullets { line, .. } => Some(*line),
+            _ => None,
+        })
+        .collect();
+
+    if !not_bullets_lines.is_empty() {
+        let para_indices: Vec<usize> = doc
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| match b {
+                Block::Paragraph { line, .. } if not_bullets_lines.contains(line) => Some(i),
+                _ => None,
+            })
+            .collect();
+
+        if !para_indices.is_empty() {
+            fixes.push(Fix::ConvertParagraphsToBullets {
+                paragraph_indices: para_indices,
+                ordered: false, // default to unordered for paragraph conversion
+            });
+        }
+    }
+
+    // WrongListType → flip ordered flag on the matching list block
+    for diag in diagnostics {
+        if let Diagnostic::WrongListType { line, expected, .. } = diag {
+            let target_ordered = expected == "ordered";
+            if let Some(idx) = doc.blocks.iter().position(|b| match b {
+                Block::List {
+                    line: l, ordered, ..
+                } => *l == *line && *ordered != target_ordered,
+                _ => false,
+            }) {
+                fixes.push(Fix::ConvertListType {
+                    list_index: idx,
+                    ordered: target_ordered,
+                });
+            }
+        }
+    }
+
+    fixes
 }
 
 // ── apply_fixes ───────────────────────────────────────────────────────────────
@@ -228,6 +345,13 @@ impl Fix {
 /// Diagnostics are applied in order. Callers should re-validate after fixing if
 /// precise line numbers matter (block indices shift after insertions/removals).
 pub fn apply_fixes(doc: &mut Document, diagnostics: &[Diagnostic]) {
+    // First apply content fixes (paragraph→bullet, list type conversion)
+    let content_fixes = build_content_fixes(doc, diagnostics);
+    for fix in &content_fixes {
+        fix.apply(doc);
+    }
+
+    // Then apply structural fixes
     for diag in diagnostics {
         if let Some(fix) = Fix::from_diagnostic(diag) {
             fix.apply(doc);
@@ -433,6 +557,142 @@ mod tests {
         assert!(!Fix::is_fixable(&Diagnostic::MalformedLink {
             line: 5,
             url: "bad url.md".to_string(),
+        }));
+    }
+
+    // ── ConvertParagraphsToBullets ─────────────────────────────────────────────
+
+    #[test]
+    fn test_convert_paragraph_to_bullet() {
+        let input = "---\ntype: t\n---\n## Goals\n\nThis is a paragraph.\n";
+        let doc = parse(input);
+        // Find the paragraph's line number for the diagnostic
+        let para_line = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Paragraph { line, .. } => Some(*line),
+                _ => None,
+            })
+            .unwrap();
+
+        let result = apply_and_serialize(
+            input,
+            &[Diagnostic::SectionNotBullets {
+                line: para_line,
+                context: "section 'Goals'".to_string(),
+            }],
+        );
+        assert!(
+            result.contains("- This is a paragraph."),
+            "paragraph should be converted to bullet: {result}"
+        );
+        assert!(
+            !result.contains("\nThis is a paragraph."),
+            "bare paragraph should be gone: {result}"
+        );
+    }
+
+    #[test]
+    fn test_convert_multiple_paragraphs_to_bullets() {
+        let input = "---\ntype: t\n---\n## Goals\n\nFirst paragraph.\n\nSecond paragraph.\n";
+        let doc = parse(input);
+        let para_diags: Vec<_> = doc
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph { line, .. } => Some(Diagnostic::SectionNotBullets {
+                    line: *line,
+                    context: "section 'Goals'".to_string(),
+                }),
+                _ => None,
+            })
+            .collect();
+
+        let mut doc = parse(input);
+        apply_fixes(&mut doc, &para_diags);
+        let result = serialize(&doc);
+        assert!(result.contains("- First paragraph."), "got: {result}");
+        assert!(result.contains("- Second paragraph."), "got: {result}");
+    }
+
+    // ── ConvertListType ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_convert_unordered_to_ordered() {
+        let input = "---\ntype: t\n---\n## Steps\n\n- First\n- Second\n";
+        let doc = parse(input);
+        let list_line = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::List { line, .. } => Some(*line),
+                _ => None,
+            })
+            .unwrap();
+
+        let result = apply_and_serialize(
+            input,
+            &[Diagnostic::WrongListType {
+                line: list_line,
+                context: "section 'Steps'".to_string(),
+                expected: "ordered".to_string(),
+            }],
+        );
+        assert!(result.contains("1."), "should be ordered list: {result}");
+        assert!(
+            !result.contains("- First"),
+            "should not have unordered markers: {result}"
+        );
+    }
+
+    #[test]
+    fn test_convert_ordered_to_unordered() {
+        let input = "---\ntype: t\n---\n## Items\n\n1. First\n2. Second\n";
+        let doc = parse(input);
+        let list_line = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::List { line, .. } => Some(*line),
+                _ => None,
+            })
+            .unwrap();
+
+        let result = apply_and_serialize(
+            input,
+            &[Diagnostic::WrongListType {
+                line: list_line,
+                context: "section 'Items'".to_string(),
+                expected: "unordered".to_string(),
+            }],
+        );
+        assert!(
+            result.contains("- First"),
+            "should be unordered list: {result}"
+        );
+        assert!(
+            !result.contains("1."),
+            "should not have ordered markers: {result}"
+        );
+    }
+
+    // ── is_fixable for new diagnostics ────────────────────────────────────────
+
+    #[test]
+    fn test_is_fixable_section_not_bullets() {
+        assert!(Fix::is_fixable(&Diagnostic::SectionNotBullets {
+            line: 5,
+            context: "section 'Goals'".to_string(),
+        }));
+    }
+
+    #[test]
+    fn test_is_fixable_wrong_list_type() {
+        assert!(Fix::is_fixable(&Diagnostic::WrongListType {
+            line: 5,
+            context: "section 'Steps'".to_string(),
+            expected: "ordered".to_string(),
         }));
     }
 }
