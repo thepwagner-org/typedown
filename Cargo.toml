@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-git2 = { version = "0.18", default-features = false }
+git2 = { version = "0.20", default-features = false }
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 gray_matter = "0.2"

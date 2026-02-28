@@ -1,8 +1,0 @@
-# Pinned dependencies for cargo-zigbuild cross-compilation.
-# To update: change versions and fetch new hashes from PyPI JSON API
-# (e.g. https://pypi.org/pypi/cargo-zigbuild/0.22.1/json).
-# Only manylinux x86_64 hashes are needed (matches ubuntu-latest runner).
-cargo-zigbuild==0.22.1 \
-    --hash=sha256:d24545d1595738c7be21be37b61122814216893b3df79db41476477f2141f438
-ziglang==0.15.2 \
-    --hash=sha256:806316453d1ede7174ed3fefb8e5348154629089c3bb5fe812dfd0e172fac130
