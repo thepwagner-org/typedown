@@ -4,13 +4,10 @@ on:
   push:
     tags: ['v*']
 
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
-
 jobs:
   build:
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -30,23 +27,22 @@ jobs:
             | jq -r '.packages[0].targets[] | select(.kind[] == "bin") | .name')
           tar czf "${bin}-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
             -C "target/${{ matrix.target }}/release" "$bin"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: build-${{ matrix.target }}
           path: '*.tar.gz'
 
   release:
     needs: build
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           merge-multiple: true
       - name: Checksums
         run: sha256sum *.tar.gz > checksums-sha256.txt
-      - uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32  # v4.1.0
-        with:
-          subject-path: '*.tar.gz'
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
