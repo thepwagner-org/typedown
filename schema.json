@@ -78,11 +78,6 @@
           "type": "string",
           "description": "H1 title validation mode. Named modes: 'none' (no validation, default), 'from_filename' (H1 must match filename stem), 'from_directory' (H1 must match parent directory name), 'from_project' (H1 must match project name or frontmatter 'name' field), 'from_date' (H1 derived from YYYY-MM filename, e.g. '2026-02.md' → 'February 2026'), 'required' (H1 must exist). Any other string is treated as fixed text — auto-created if missing."
         },
-        "frontmatter": {
-          "type": "array",
-          "description": "Ordered list of frontmatter fields for serialization order and presence checks. For type/value validation use 'fields' instead.",
-          "items": { "$ref": "#/$defs/frontmatter_field_def" }
-        },
         "intro": {
           "$ref": "#/$defs/section_def",
           "description": "Content between H1 and the first H2. The section's 'title' field is unused here."
@@ -121,6 +116,10 @@
         "title": {
           "type": "string",
           "description": "Exact H2 heading text. Must match the markdown heading exactly. Unused for 'intro'."
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of this section. Ignored by the engine; useful as LLM guidance."
         },
         "bullets": {
           "oneOf": [
@@ -189,27 +188,6 @@
           "enum": ["newest_first", "oldest_first"],
           "default": "newest_first",
           "description": "Sort order for date entries. 'newest_first' (default) is reverse chronological. 'oldest_first' is chronological (e.g. changelogs)."
-        }
-      }
-    },
-    "frontmatter_field_def": {
-      "type": "object",
-      "description": "A frontmatter field declaration for serialization ordering and presence checks. For type/value validation use the top-level 'fields' map.",
-      "required": ["name"],
-      "additionalProperties": false,
-      "properties": {
-        "name": {
-          "type": "string",
-          "description": "Frontmatter field key."
-        },
-        "required": {
-          "type": "boolean",
-          "default": false,
-          "description": "Whether this field must be present in the document's frontmatter."
-        },
-        "description": {
-          "type": "string",
-          "description": "Documentation for this field. Ignored by the engine; useful as LLM guidance."
         }
       }
     }

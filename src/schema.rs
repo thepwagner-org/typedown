@@ -200,6 +200,7 @@ impl TypeDef {
 ///
 /// All fields are settable from YAML -- no built-in-only knobs.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StructureDef {
     /// H1 title validation mode (default: `none`).
     #[serde(default)]
@@ -379,6 +380,10 @@ pub struct SectionDef {
     /// Section heading text (not used for `intro`).
     #[serde(default)]
     pub title: String,
+    /// Human-readable description. Ignored by the engine; useful for LLM guidance.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub description: Option<String>,
     /// Restrict content to bullet lists only (default: `None` → any content allowed).
     ///
     /// `any` — any list type; `ordered` — numbered lists only; `unordered` — dash lists only.

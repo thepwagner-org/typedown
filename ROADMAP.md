@@ -25,15 +25,6 @@ When a link is broken, try to fix it instead of just reporting it.
 - Needs a search scope -- probably the repo root or the directory `td fmt` is pointed at.
 - High-confidence fixes should be applied by `td fmt`. Suggestions should be unfixable diagnostics.
 
-## Watch Mode
-
-`td fmt --watch` for continuous formatting during development.
-**Possible approaches:**
-
-- inotify/kqueue file watching
-- Debounced formatting on change
-- Only re-validate changed files and their link targets
-
 ## Non-Goals
 
 Explicitly out of scope to keep the project focused:
@@ -44,6 +35,7 @@ Explicitly out of scope to keep the project focused:
 - **Opinionated defaults** -- no built-in types, no "you must have a README". Schemas define everything.
 - **Non-markdown formats** -- markdown only. No RST, AsciiDoc, or HTML.
 - **Encryption** -- the complexity of encryption (AES-256-GCM, GPG key wrapping) wasn't worth it in practice. Not planned.
+- **Watch mode** -- the LSP server already publishes diagnostics on open/change, so editors get continuous feedback without a separate `td fmt --watch` process.
 
 ## See Also
 

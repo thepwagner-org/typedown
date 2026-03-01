@@ -763,13 +763,17 @@ fn validate_title(
                 None => out.push(Diagnostic::MissingH1 { expected }),
             }
         }
-        TitleMode::Fixed(expected) => {
-            if h1.is_none() {
-                out.push(Diagnostic::MissingH1 {
-                    expected: expected.clone(),
-                });
-            }
-        }
+        TitleMode::Fixed(expected) => match h1 {
+            Some((title, _)) if title == *expected => {}
+            Some((actual, line)) => out.push(Diagnostic::H1Mismatch {
+                line,
+                expected: expected.clone(),
+                actual,
+            }),
+            None => out.push(Diagnostic::MissingH1 {
+                expected: expected.clone(),
+            }),
+        },
         TitleMode::RequiredAny => {
             if h1.is_none() {
                 out.push(Diagnostic::MissingH1 {
@@ -1875,6 +1879,24 @@ mod tests {
         let doc = parse("---\ntype: page\n---\n# wrong title\n");
         let path = Path::new("my-page.md");
         let diags = validate(&doc, &type_def, &make_ctx("page", path, &schema, &[]), None);
+        assert!(
+            diags
+                .iter()
+                .any(|d| matches!(d, Diagnostic::H1Mismatch { .. })),
+            "got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_fixed_title_mismatch() {
+        let (schema, type_def) = make_schema("t", "structure:\n  title: Roadmap\n");
+        let doc = parse("---\ntype: t\n---\n# Wrong Title\n");
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("t", empty_path(), &schema, &[]),
+            None,
+        );
         assert!(
             diags
                 .iter()
