@@ -423,9 +423,7 @@ pub fn validate(
     validate_fields(fm, type_def, &mut diagnostics);
     validate_structure(doc, &type_def.structure, ctx, &mut diagnostics);
 
-    if type_def.structure.validate_all_links {
-        validate_all_links(doc, ctx, &mut diagnostics);
-    }
+    validate_all_links(doc, ctx, &mut diagnostics);
 
     diagnostics
 }
@@ -1389,7 +1387,7 @@ fn validate_all_links(doc: &Document, ctx: &ValidateCtx<'_>, out: &mut Vec<Diagn
     }
 }
 
-/// Extract all link URLs from the bullet items within a section's blocks.
+/// Extract all link and image URLs from a block list.
 fn extract_links(blocks: &[Block]) -> Vec<String> {
     let mut links = Vec::new();
     for block in blocks {
@@ -1400,6 +1398,9 @@ fn extract_links(blocks: &[Block]) -> Vec<String> {
 
 fn collect_links_from_block(block: &Block, links: &mut Vec<String>) {
     match block {
+        Block::Heading { content, .. } | Block::Paragraph { content, .. } => {
+            collect_links_from_inlines(content, links)
+        }
         Block::List { items, .. } => {
             for item in items {
                 collect_links_from_inlines(&item.content, links);
@@ -1408,7 +1409,21 @@ fn collect_links_from_block(block: &Block, links: &mut Vec<String>) {
                 }
             }
         }
-        Block::Paragraph { content, .. } => collect_links_from_inlines(content, links),
+        Block::BlockQuote { blocks, .. } => {
+            for inner in blocks {
+                collect_links_from_block(inner, links);
+            }
+        }
+        Block::Table { header, rows, .. } => {
+            for cell in header {
+                collect_links_from_inlines(cell, links);
+            }
+            for row in rows {
+                for cell in row {
+                    collect_links_from_inlines(cell, links);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -1416,8 +1431,8 @@ fn collect_links_from_block(block: &Block, links: &mut Vec<String>) {
 fn collect_links_from_inlines(inlines: &[Inline], links: &mut Vec<String>) {
     for inline in inlines {
         match inline {
-            Inline::Link { url, .. } => links.push(url.clone()),
-            Inline::Strong(inner) | Inline::Emphasis(inner) => {
+            Inline::Link { url, .. } | Inline::Image { url, .. } => links.push(url.clone()),
+            Inline::Strong(inner) | Inline::Emphasis(inner) | Inline::Strikethrough(inner) => {
                 collect_links_from_inlines(inner, links)
             }
             _ => {}
@@ -1433,7 +1448,13 @@ pub fn resolve_link_path(link: &str, source_path: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    let decoded = percent_decode(link);
+    let path_only = link.split_once('#').map_or(link, |(p, _)| p);
+    let path_only = path_only.split_once('?').map_or(path_only, |(p, _)| p);
+    if path_only.is_empty() {
+        return None;
+    }
+
+    let decoded = percent_decode(path_only);
     let base_dir = source_path.parent()?;
     let resolved = base_dir.join(Path::new(&decoded));
     Some(normalize_path(&resolved))
@@ -2579,7 +2600,7 @@ structure:
     #[test]
     fn test_broken_link_reported() {
         // A link to a file not in linked_docs and no git_tree → UnknownType diagnostic
-        let yaml = "structure:\n  validate_all_links: true\n";
+        let yaml = "description: doc\n";
         let (schema, type_def) = make_schema("doc", yaml);
         let doc = parse("---\ntype: doc\n---\n# Title\n\nSee [this](missing.md).\n");
         let path = Path::new("/project/doc.md");
@@ -2596,7 +2617,7 @@ structure:
     #[test]
     fn test_percent_encoded_link_resolves_to_known_doc() {
         // A %20-encoded link should resolve and match a pre-loaded LinkedDocInfo
-        let yaml = "structure:\n  validate_all_links: true\n";
+        let yaml = "description: doc\n";
         let (schema, type_def) = make_schema("doc", yaml);
         let doc = parse("---\ntype: doc\n---\n# Title\n\nSee [this](other%20doc.md).\n");
         let source_path = Path::new("/project/doc.md");
@@ -2618,6 +2639,37 @@ structure:
                 if message.contains("broken link"))),
             "percent-encoded link should resolve, got: {diags:?}"
         );
+    }
+
+    #[test]
+    fn test_validate_all_internal_links_across_blocks() {
+        let (schema, type_def) = make_schema("doc", "description: doc\n");
+        let doc = parse(
+            "---\ntype: doc\n---\n# [Head](missing-head.md)\n\n> [Quote](missing-quote.md)\n\n| Col |\n| --- |\n| [Cell](missing-table.md) |\n\n![Alt](missing-image.png)\n",
+        );
+        let path = Path::new("/project/doc.md");
+        let diags = validate(&doc, &type_def, &make_ctx("doc", path, &schema, &[]), None);
+
+        for url in [
+            "missing-head.md",
+            "missing-quote.md",
+            "missing-table.md",
+            "missing-image.png",
+        ] {
+            assert!(
+                diags.iter().any(
+                    |d| matches!(d, Diagnostic::UnknownType { message, .. } if message.contains(url))
+                ),
+                "expected broken link diagnostic for {url}, got: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_link_path_strips_query_and_fragment() {
+        let source = Path::new("/project/doc.md");
+        let resolved = resolve_link_path("guide.md?view=full#section-1", source);
+        assert_eq!(resolved, Some(PathBuf::from("/project/guide.md")));
     }
 
     // ── List field validation ─────────────────────────────────────────────────

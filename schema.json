@@ -92,11 +92,6 @@
           "default": true,
           "description": "When true (default), sections must appear in schema-defined order and unlisted H2s are rejected. Set false to allow freeform sections."
         },
-        "validate_all_links": {
-          "type": "boolean",
-          "default": true,
-          "description": "When true (default), all links in the document are checked for existence."
-        },
         "size_warning": {
           "type": "integer",
           "minimum": 1,
