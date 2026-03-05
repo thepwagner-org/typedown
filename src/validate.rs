@@ -423,9 +423,7 @@ pub fn validate(
     validate_fields(fm, type_def, &mut diagnostics);
     validate_structure(doc, &type_def.structure, ctx, &mut diagnostics);
 
-    if type_def.structure.validate_all_links {
-        validate_all_links(doc, ctx, &mut diagnostics);
-    }
+    validate_all_links(doc, ctx, &mut diagnostics);
 
     diagnostics
 }
@@ -1259,6 +1257,69 @@ fn validate_section_intro(
     }
 }
 
+/// Compare two slices of blocks for structural equality, ignoring source line numbers.
+///
+/// `Block::PartialEq` includes the `line` field, so template blocks (parsed from
+/// a string at line 1) would never compare equal to document blocks (parsed from a
+/// file at arbitrary line numbers). This helper zeroes every line before comparing.
+fn blocks_content_equal(a: &[Block], b: &[Block]) -> bool {
+    fn zero_line(block: &Block) -> Block {
+        match block {
+            Block::Heading { level, content, .. } => Block::Heading {
+                level: *level,
+                content: content.clone(),
+                line: 0,
+            },
+            Block::Paragraph { content, .. } => Block::Paragraph {
+                content: content.clone(),
+                line: 0,
+            },
+            Block::List { items, ordered, .. } => Block::List {
+                items: items
+                    .iter()
+                    .map(|item| crate::ast::ListItem {
+                        content: item.content.clone(),
+                        children: item.children.iter().map(zero_line).collect(),
+                    })
+                    .collect(),
+                ordered: *ordered,
+                line: 0,
+            },
+            Block::CodeBlock {
+                language, content, ..
+            } => Block::CodeBlock {
+                language: language.clone(),
+                content: content.clone(),
+                line: 0,
+            },
+            Block::BlockQuote { blocks, .. } => Block::BlockQuote {
+                blocks: blocks.iter().map(zero_line).collect(),
+                line: 0,
+            },
+            Block::Table {
+                alignments,
+                header,
+                rows,
+                ..
+            } => Block::Table {
+                alignments: alignments.clone(),
+                header: header.clone(),
+                rows: rows.clone(),
+                line: 0,
+            },
+            Block::ThematicBreak { .. } => Block::ThematicBreak { line: 0 },
+            Block::BlankLine => Block::BlankLine,
+        }
+    }
+
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| zero_line(x) == zero_line(y))
+}
+
 fn validate_managed_section(
     doc: &Document,
     section_title: &str,
@@ -1287,22 +1348,95 @@ fn validate_managed_section(
                 .cloned()
                 .collect();
 
-            let custom_content: Vec<Block> = if existing_content.len() > template_content_count {
-                existing_content[template_content_count..].to_vec()
-            } else {
-                vec![]
+            let expected_blocks: Vec<Block> = template_blocks
+                .iter()
+                .filter(|b| !matches!(b, Block::BlankLine))
+                .cloned()
+                .collect();
+
+            // Extract user-added content that lives beyond (or appended to) the
+            // template blocks.  Two cases:
+            //
+            // 1. Extra whole blocks after the template: collect them directly.
+            // 2. Extra list items appended to the last template block (which is a
+            //    list): lift them out as a separate list block so the fix can
+            //    re-append them without losing them.
+            let custom_content: Vec<Block> = {
+                let mut custom = Vec::new();
+
+                // Whole blocks beyond the template prefix
+                if existing_content.len() > template_content_count {
+                    custom.extend_from_slice(&existing_content[template_content_count..]);
+                }
+
+                // Extra items appended to the last template list block
+                if let (
+                    Some(Block::List {
+                        items: tmpl_items,
+                        ordered: tmpl_ordered,
+                        ..
+                    }),
+                    Some(Block::List {
+                        items: exist_items,
+                        ordered: exist_ordered,
+                        ..
+                    }),
+                ) = (
+                    expected_blocks.last(),
+                    existing_content.get(template_content_count.saturating_sub(1)),
+                ) {
+                    if tmpl_ordered == exist_ordered && exist_items.len() > tmpl_items.len() {
+                        let extra_items = exist_items[tmpl_items.len()..].to_vec();
+                        custom.push(Block::List {
+                            items: extra_items,
+                            ordered: *exist_ordered,
+                            line: 0,
+                        });
+                    }
+                }
+
+                custom
             };
 
             let needs_update = !legacy_sections.is_empty() || {
-                let existing_portion: Vec<_> = existing_content
-                    .iter()
-                    .take(template_content_count)
-                    .collect();
-                let expected_portion: Vec<_> = template_blocks
-                    .iter()
-                    .filter(|b| !matches!(b, Block::BlankLine))
-                    .collect();
-                existing_portion.len() != expected_portion.len()
+                // Compare the template prefix against the existing content,
+                // ignoring any extra items that may have been appended to the
+                // last list block (those are captured in custom_content above).
+                let existing_prefix: Vec<Block> = {
+                    let mut prefix = existing_content
+                        .iter()
+                        .take(template_content_count)
+                        .cloned()
+                        .collect::<Vec<_>>();
+
+                    // If the last block of the prefix is a list with more items
+                    // than the template expects, truncate it to the template
+                    // length for the comparison (the extras are custom content).
+                    if let (
+                        Some(Block::List {
+                            items: tmpl_items, ..
+                        }),
+                        Some(Block::List {
+                            items: exist_items,
+                            ordered,
+                            line,
+                        }),
+                    ) = (expected_blocks.last(), prefix.last_mut())
+                    {
+                        if exist_items.len() > tmpl_items.len() {
+                            let truncated = exist_items[..tmpl_items.len()].to_vec();
+                            *prefix.last_mut().unwrap() = Block::List {
+                                items: truncated,
+                                ordered: *ordered,
+                                line: *line,
+                            };
+                        }
+                    }
+
+                    prefix
+                };
+
+                !blocks_content_equal(&existing_prefix, &expected_blocks)
             };
 
             if needs_update {
@@ -1371,7 +1505,7 @@ fn find_managed_section(
 /// covers everything else tracked in HEAD (e.g. cross-project links).
 fn validate_all_links(doc: &Document, ctx: &ValidateCtx<'_>, out: &mut Vec<Diagnostic>) {
     let all_urls = extract_links(&doc.blocks);
-    for url in all_urls {
+    for (url, line) in all_urls {
         if url.starts_with("http://") || url.starts_with("https://") || url.starts_with('#') {
             continue;
         }
@@ -1382,15 +1516,15 @@ fn validate_all_links(doc: &Document, ctx: &ValidateCtx<'_>, out: &mut Vec<Diagn
         let in_git = ctx.git_tree.is_some_and(|t| t.contains(&target));
         if !in_linked && !in_git {
             out.push(Diagnostic::UnknownType {
-                line: 0,
+                line,
                 message: format!("broken link: '{url}' does not exist"),
             });
         }
     }
 }
 
-/// Extract all link URLs from the bullet items within a section's blocks.
-fn extract_links(blocks: &[Block]) -> Vec<String> {
+/// Extract all link and image URLs from a block list.
+fn extract_links(blocks: &[Block]) -> Vec<(String, usize)> {
     let mut links = Vec::new();
     for block in blocks {
         collect_links_from_block(block, &mut links);
@@ -1398,27 +1532,45 @@ fn extract_links(blocks: &[Block]) -> Vec<String> {
     links
 }
 
-fn collect_links_from_block(block: &Block, links: &mut Vec<String>) {
+fn collect_links_from_block(block: &Block, links: &mut Vec<(String, usize)>) {
+    let line = block.line();
     match block {
+        Block::Heading { content, .. } | Block::Paragraph { content, .. } => {
+            collect_links_from_inlines(content, line, links)
+        }
         Block::List { items, .. } => {
             for item in items {
-                collect_links_from_inlines(&item.content, links);
+                collect_links_from_inlines(&item.content, line, links);
                 for child in &item.children {
                     collect_links_from_block(child, links);
                 }
             }
         }
-        Block::Paragraph { content, .. } => collect_links_from_inlines(content, links),
+        Block::BlockQuote { blocks, .. } => {
+            for inner in blocks {
+                collect_links_from_block(inner, links);
+            }
+        }
+        Block::Table { header, rows, .. } => {
+            for cell in header {
+                collect_links_from_inlines(cell, line, links);
+            }
+            for row in rows {
+                for cell in row {
+                    collect_links_from_inlines(cell, line, links);
+                }
+            }
+        }
         _ => {}
     }
 }
 
-fn collect_links_from_inlines(inlines: &[Inline], links: &mut Vec<String>) {
+fn collect_links_from_inlines(inlines: &[Inline], line: usize, links: &mut Vec<(String, usize)>) {
     for inline in inlines {
         match inline {
-            Inline::Link { url, .. } => links.push(url.clone()),
-            Inline::Strong(inner) | Inline::Emphasis(inner) => {
-                collect_links_from_inlines(inner, links)
+            Inline::Link { url, .. } | Inline::Image { url, .. } => links.push((url.clone(), line)),
+            Inline::Strong(inner) | Inline::Emphasis(inner) | Inline::Strikethrough(inner) => {
+                collect_links_from_inlines(inner, line, links)
             }
             _ => {}
         }
@@ -1433,7 +1585,13 @@ pub fn resolve_link_path(link: &str, source_path: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    let decoded = percent_decode(link);
+    let path_only = link.split_once('#').map_or(link, |(p, _)| p);
+    let path_only = path_only.split_once('?').map_or(path_only, |(p, _)| p);
+    if path_only.is_empty() {
+        return None;
+    }
+
+    let decoded = percent_decode(path_only);
     let base_dir = source_path.parent()?;
     let resolved = base_dir.join(Path::new(&decoded));
     Some(normalize_path(&resolved))
@@ -1485,7 +1643,7 @@ fn validate_section_links(
 ) {
     let links = extract_links(section_blocks);
 
-    for url in &links {
+    for (url, _link_line) in &links {
         if url.starts_with("http://") || url.starts_with("https://") {
             continue;
         }
@@ -2579,7 +2737,7 @@ structure:
     #[test]
     fn test_broken_link_reported() {
         // A link to a file not in linked_docs and no git_tree → UnknownType diagnostic
-        let yaml = "structure:\n  validate_all_links: true\n";
+        let yaml = "description: doc\n";
         let (schema, type_def) = make_schema("doc", yaml);
         let doc = parse("---\ntype: doc\n---\n# Title\n\nSee [this](missing.md).\n");
         let path = Path::new("/project/doc.md");
@@ -2596,7 +2754,7 @@ structure:
     #[test]
     fn test_percent_encoded_link_resolves_to_known_doc() {
         // A %20-encoded link should resolve and match a pre-loaded LinkedDocInfo
-        let yaml = "structure:\n  validate_all_links: true\n";
+        let yaml = "description: doc\n";
         let (schema, type_def) = make_schema("doc", yaml);
         let doc = parse("---\ntype: doc\n---\n# Title\n\nSee [this](other%20doc.md).\n");
         let source_path = Path::new("/project/doc.md");
@@ -2618,6 +2776,37 @@ structure:
                 if message.contains("broken link"))),
             "percent-encoded link should resolve, got: {diags:?}"
         );
+    }
+
+    #[test]
+    fn test_validate_all_internal_links_across_blocks() {
+        let (schema, type_def) = make_schema("doc", "description: doc\n");
+        let doc = parse(
+            "---\ntype: doc\n---\n# [Head](missing-head.md)\n\n> [Quote](missing-quote.md)\n\n| Col |\n| --- |\n| [Cell](missing-table.md) |\n\n![Alt](missing-image.png)\n",
+        );
+        let path = Path::new("/project/doc.md");
+        let diags = validate(&doc, &type_def, &make_ctx("doc", path, &schema, &[]), None);
+
+        for url in [
+            "missing-head.md",
+            "missing-quote.md",
+            "missing-table.md",
+            "missing-image.png",
+        ] {
+            assert!(
+                diags.iter().any(
+                    |d| matches!(d, Diagnostic::UnknownType { message, .. } if message.contains(url))
+                ),
+                "expected broken link diagnostic for {url}, got: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_link_path_strips_query_and_fragment() {
+        let source = Path::new("/project/doc.md");
+        let resolved = resolve_link_path("guide.md?view=full#section-1", source);
+        assert_eq!(resolved, Some(PathBuf::from("/project/guide.md")));
     }
 
     // ── List field validation ─────────────────────────────────────────────────
@@ -2952,5 +3141,49 @@ structure:
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_managed_section_detects_content_drift() {
+        // Changing a word inside a managed section's body must trigger
+        // ManagedSectionNeedsUpdate even when the block count is unchanged.
+        // Regression test: the old implementation only compared block count,
+        // so single-word changes were silently accepted.
+        let yaml = "structure:\n  sections:\n    - title: How It Works\n      managed_content:\n        template: |\n          ## How It Works\n\n          These are the canonical instructions.\n";
+        let (schema, type_def) = make_schema("doc", yaml);
+
+        // Exact match — no diagnostic expected.
+        let doc_clean = parse(
+            "---\ntype: doc\n---\n# Title\n\n## How It Works\n\nThese are the canonical instructions.\n",
+        );
+        let diags_clean = validate(
+            &doc_clean,
+            &type_def,
+            &make_ctx("doc", empty_path(), &schema, &[]),
+            None,
+        );
+        assert!(
+            !diags_clean
+                .iter()
+                .any(|d| matches!(d, Diagnostic::ManagedSectionNeedsUpdate { .. })),
+            "clean document should not trigger ManagedSectionNeedsUpdate"
+        );
+
+        // One word changed — drift must be detected.
+        let doc_drifted = parse(
+            "---\ntype: doc\n---\n# Title\n\n## How It Works\n\nThese are the updated instructions.\n",
+        );
+        let diags_drifted = validate(
+            &doc_drifted,
+            &type_def,
+            &make_ctx("doc", empty_path(), &schema, &[]),
+            None,
+        );
+        assert!(
+            diags_drifted
+                .iter()
+                .any(|d| matches!(d, Diagnostic::ManagedSectionNeedsUpdate { .. })),
+            "word change in managed section body should trigger ManagedSectionNeedsUpdate"
+        );
     }
 }

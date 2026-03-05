@@ -1,0 +1,44 @@
+description: >-
+  A typedown feature test document. Describes a feature while being validated
+  by it. Each file exercises specific schema capabilities so a dumb agent
+  breaking the file gets caught by the very feature it's editing.
+paths:
+  - "test-docs/features/*.md"
+
+fields:
+  status:
+    type: enum
+    required: true
+    values: [passing, failing, untested]
+  complexity:
+    type: integer
+    required: true
+  added:
+    type: date
+  breaking:
+    type: bool
+  tags:
+    type: list
+    item_type: enum
+    values: [frontmatter, structure, links, formatting, auto-fix]
+
+structure:
+  title: from_filename
+  strict_sections: true
+  size_warning: 2000
+  sections:
+    - title: What It Tests
+      required: true
+      description: Explain what this feature validates and why it matters.
+    - title: How to Break It
+      required: true
+      bullets: unordered
+      template: "- **Text**: Text"
+    - title: Expected Errors
+      required: true
+      bullets: ordered
+    - title: Related Features
+      links:
+        target_type: test-feature
+        bidirectional: true
+    - title: Notes

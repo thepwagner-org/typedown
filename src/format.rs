@@ -615,6 +615,9 @@ fn extract_all_links(blocks: &[crate::ast::Block]) -> Vec<String> {
 fn collect_links(block: &crate::ast::Block, links: &mut Vec<String>) {
     use crate::ast::Block;
     match block {
+        Block::Heading { content, .. } | Block::Paragraph { content, .. } => {
+            collect_inline_links(content, links)
+        }
         Block::List { items, .. } => {
             for item in items {
                 collect_inline_links(&item.content, links);
@@ -623,7 +626,21 @@ fn collect_links(block: &crate::ast::Block, links: &mut Vec<String>) {
                 }
             }
         }
-        Block::Paragraph { content, .. } => collect_inline_links(content, links),
+        Block::BlockQuote { blocks, .. } => {
+            for inner in blocks {
+                collect_links(inner, links);
+            }
+        }
+        Block::Table { header, rows, .. } => {
+            for cell in header {
+                collect_inline_links(cell, links);
+            }
+            for row in rows {
+                for cell in row {
+                    collect_inline_links(cell, links);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -632,8 +649,10 @@ fn collect_inline_links(inlines: &[crate::ast::Inline], links: &mut Vec<String>)
     use crate::ast::Inline;
     for inline in inlines {
         match inline {
-            Inline::Link { url, .. } => links.push(url.clone()),
-            Inline::Strong(inner) | Inline::Emphasis(inner) => collect_inline_links(inner, links),
+            Inline::Link { url, .. } | Inline::Image { url, .. } => links.push(url.clone()),
+            Inline::Strong(inner) | Inline::Emphasis(inner) | Inline::Strikethrough(inner) => {
+                collect_inline_links(inner, links)
+            }
             _ => {}
         }
     }

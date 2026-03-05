@@ -1,0 +1,31 @@
+description: >-
+  The test-docs overview page. Exercises from_directory title mode, the
+  structure-level intro section (content between H1 and the first H2),
+  and link target_type without bidirectional.
+paths:
+  - "test-docs/OVERVIEW.md"
+
+fields:
+  maintained_by:
+    type: string
+    required: true
+  version:
+    type: string
+
+structure:
+  title: from_directory
+  strict_sections: true
+  intro:
+    bullets: unordered
+  sections:
+    - title: Sections
+      required: true
+      bullets: unordered
+      links:
+        target_type: test-index
+    - title: Coverage
+      required: true
+      bullets: unordered
+      template: "- **Text**: Text"
+    - title: Running the Suite
+      required: true

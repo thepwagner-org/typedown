@@ -1,0 +1,36 @@
+description: >-
+  The index page for the typedown test suite. Lists all feature test documents
+  and explains how the suite works. Exercises fixed title, managed content,
+  intro_text, and link target_type validation.
+paths:
+  - "test-docs/INDEX.md"
+
+fields:
+  edition:
+    type: integer
+    required: true
+  updated:
+    type: date
+    required: true
+
+structure:
+  title: Test Index
+  strict_sections: true
+  sections:
+    - title: Features
+      required: true
+      bullets: unordered
+      links:
+        target_type: test-feature
+    - title: How This Works
+      managed_content:
+        template: |
+          ## How This Works
+
+          These test documents are self-referential: each file documents a
+          typedown feature while being validated by that same feature. Break
+          a file and typedown catches it. Run `td check` to see errors or
+          `td fmt` to auto-fix what it can.
+    - title: Out of Scope
+      required: true
+      intro_text: "Things this test suite intentionally does not cover:"

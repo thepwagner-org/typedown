@@ -215,9 +215,6 @@ pub struct StructureDef {
     /// When `false`, unlisted sections are allowed and ordering is not enforced.
     #[serde(default = "default_true")]
     pub strict_sections: bool,
-    /// Validate all links in the document (default: `true`).
-    #[serde(default = "default_true")]
-    pub validate_all_links: bool,
     /// Emit a warning if the file exceeds this many bytes.
     #[serde(default)]
     pub size_warning: Option<usize>,
@@ -241,7 +238,6 @@ impl Default for StructureDef {
             intro: None,
             sections: Vec::new(),
             strict_sections: true,
-            validate_all_links: true,
             size_warning: None,
             date_headings: None,
         }
@@ -818,7 +814,6 @@ fields:
         let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(td.structure.title, TitleMode::None);
         assert!(td.structure.strict_sections);
-        assert!(td.structure.validate_all_links);
         assert!(td.structure.size_warning.is_none());
         assert!(td.structure.sections.is_empty());
     }
@@ -833,7 +828,6 @@ fields:
 structure:
   title: from_filename
   strict_sections: false
-  validate_all_links: true
   size_warning: 4000
   sections:
     - title: Notes
@@ -843,7 +837,6 @@ structure:
         let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(td.structure.title, TitleMode::FromFilename);
         assert!(!td.structure.strict_sections);
-        assert!(td.structure.validate_all_links);
         assert_eq!(td.structure.size_warning, Some(4000));
         assert_eq!(td.fields.len(), 1);
         assert!(td.fields["category"].required);

@@ -1,0 +1,11 @@
+description: >-
+  A test activity log. Monthly file with one H2 per test run, sorted oldest
+  first (chronological). Exercises from_date title mode, date_headings with
+  oldest_first sort.
+paths:
+  - "test-docs/log/*.md"
+
+structure:
+  title: from_date
+  date_headings:
+    sort: oldest_first
