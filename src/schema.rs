@@ -401,6 +401,11 @@ pub struct SectionDef {
     /// Required intro paragraph prefix; auto-inserted if missing.
     #[serde(default)]
     pub intro_text: Option<String>,
+    /// Property map for top-level list items: each item's sub-items are parsed
+    /// as `Key: Value` pairs, validated against these field definitions, and
+    /// extracted into a `properties` object in `td json` output.
+    #[serde(default)]
+    pub properties: Option<IndexMap<String, FieldDef>>,
 }
 
 impl SectionDef {
@@ -599,7 +604,11 @@ fn matches_recursive(s: &str, segments: &[TemplateSegment]) -> bool {
             match_date_pattern(s).is_some_and(|end| matches_recursive(&s[end..], &segments[1..]))
         }
         TemplateSegment::Text => {
-            (0..=s.len()).any(|end| matches_recursive(&s[end..], &segments[1..]))
+            // Iterate only over valid char boundaries to avoid panicking on
+            // multi-byte characters (e.g. em dash is 3 bytes in UTF-8).
+            std::iter::once(0)
+                .chain(s.char_indices().map(|(i, c)| i + c.len_utf8()))
+                .any(|end| matches_recursive(&s[end..], &segments[1..]))
         }
     }
 }
@@ -1075,6 +1084,19 @@ structure:
     fn test_matches_template_text() {
         let segs = parse_template("[link](url) - Text");
         assert!(matches_template("[foo](bar) - anything goes here", &segs));
+    }
+
+    #[test]
+    fn test_matches_template_text_multibyte() {
+        // Text wildcard must not panic on 3-byte UTF-8 chars (e.g. em dash U+2014).
+        let segs = parse_template("- Text");
+        assert!(matches_template("- em\u{2014}dash", &segs));
+        assert!(matches_template("- \u{2014}", &segs));
+        assert!(!matches_template("no prefix", &segs));
+
+        // Wildcard at the end: any suffix including multi-byte chars.
+        let segs2 = parse_template("prefix Text");
+        assert!(matches_template("prefix \u{2014}emdash\u{2014}", &segs2));
     }
 
     #[test]

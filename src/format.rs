@@ -7,11 +7,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use rayon::prelude::*;
+
 use anyhow::{Context, Result};
 use tracing::debug;
 use walkdir::WalkDir;
 
 use crate::{
+    ast::Document,
     fix::apply_fixes,
     parse::{get_frontmatter_error, parse, serialize, serialize_with_field_order},
     schema::{self, PathMatcher, Schema, SCHEMA_DIR},
@@ -62,49 +65,55 @@ pub fn format_dir(root: &Path, opts: FormatOptions) -> Result<FormatResult> {
     debug!(schema_dirs = schemas.len(), "loaded schemas");
 
     // Pre-load linked-doc info for bidirectional link validation.
-    // Key: absolute path → LinkedDocInfo
-    let linked_docs = preload_linked_docs(root, &schemas, &matchers);
+    // Key: absolute path → LinkedDocInfo.  Also returns a doc cache so
+    // format_file can skip re-reading/re-parsing files it already has.
+    let (linked_docs, doc_cache) = preload_linked_docs(root, &schemas, &matchers);
     debug!(linked_docs = linked_docs.len(), "preloaded linked docs");
 
     // Pre-load git-tracked paths for cross-project link validation.
     let git_tree = crate::git::list_git_paths(root);
 
-    let walker = WalkDir::new(root)
+    // Collect all markdown paths (WalkDir is sequential by design).
+    let paths: Vec<PathBuf> = WalkDir::new(root)
         .into_iter()
-        .filter_entry(|e| !is_ignored(e.file_name().to_str().unwrap_or("")));
+        .filter_entry(|e| !is_ignored(e.file_name().to_str().unwrap_or("")))
+        .filter_map(|e| e.ok())
+        .filter(|e| is_markdown(e.path()))
+        .map(|e| e.path().to_path_buf())
+        .collect();
 
-    for entry in walker.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if !is_markdown(path) {
-            continue;
-        }
+    result.files_checked = paths.len();
 
-        result.files_checked += 1;
+    // Process files in parallel.  Each format_file call is independent: it
+    // reads (from cache), applies fixes, and writes its own file.
+    let outcomes: Vec<Result<Option<bool>, (PathBuf, anyhow::Error)>> = paths
+        .par_iter()
+        .map(|path| {
+            format_file(
+                path,
+                root,
+                &schemas,
+                &matchers,
+                &linked_docs,
+                &doc_cache,
+                git_tree.as_ref(),
+                opts,
+            )
+            .map_err(|e| (path.clone(), e))
+        })
+        .collect();
 
-        match format_file(
-            path,
-            root,
-            &schemas,
-            &matchers,
-            &linked_docs,
-            git_tree.as_ref(),
-            opts,
-        ) {
-            Ok(Some(changed)) => {
-                if changed {
-                    result.files_changed += 1;
-                }
-            }
-            Ok(None) => {} // No schema covers this file
-            Err(e) => {
-                result.errors.push(FileError {
-                    path: path.to_path_buf(),
-                    diagnostics: vec![Diagnostic::UnknownType {
-                        line: 0,
-                        message: format!("error processing file: {e}"),
-                    }],
-                });
-            }
+    for outcome in outcomes {
+        match outcome {
+            Ok(Some(true)) => result.files_changed += 1,
+            Ok(Some(false)) | Ok(None) => {}
+            Err((path, e)) => result.errors.push(FileError {
+                path,
+                diagnostics: vec![Diagnostic::UnknownType {
+                    line: 0,
+                    message: format!("error processing file: {e}"),
+                }],
+            }),
         }
     }
 
@@ -118,38 +127,46 @@ pub fn check_dir(root: &Path) -> Result<Vec<FileError>> {
     let mut result = FormatResult::default();
     let (schemas, matchers) = load_all_schemas(root, &mut result);
     debug!(schema_dirs = schemas.len(), "loaded schemas");
-    let linked_docs = preload_linked_docs(root, &schemas, &matchers);
+    let (linked_docs, doc_cache) = preload_linked_docs(root, &schemas, &matchers);
     debug!(linked_docs = linked_docs.len(), "preloaded linked docs");
     let git_tree = crate::git::list_git_paths(root);
 
     let mut file_errors: Vec<FileError> = result.errors; // schema load errors
 
-    let walker = WalkDir::new(root)
+    // Collect all markdown paths (WalkDir is sequential by design).
+    let paths: Vec<PathBuf> = WalkDir::new(root)
         .into_iter()
-        .filter_entry(|e| !is_ignored(e.file_name().to_str().unwrap_or("")));
+        .filter_entry(|e| !is_ignored(e.file_name().to_str().unwrap_or("")))
+        .filter_map(|e| e.ok())
+        .filter(|e| is_markdown(e.path()))
+        .map(|e| e.path().to_path_buf())
+        .collect();
 
-    for entry in walker.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if !is_markdown(path) {
-            continue;
-        }
+    // Check files in parallel; each is independent (read-only validation).
+    let parallel_errors: Vec<FileError> = paths
+        .par_iter()
+        .filter_map(|path| {
+            let diagnostics = check_file(
+                path,
+                root,
+                &schemas,
+                &matchers,
+                &linked_docs,
+                &doc_cache,
+                git_tree.as_ref(),
+            );
+            if diagnostics.is_empty() {
+                None
+            } else {
+                Some(FileError {
+                    path: path.clone(),
+                    diagnostics,
+                })
+            }
+        })
+        .collect();
 
-        let diagnostics = check_file(
-            path,
-            root,
-            &schemas,
-            &matchers,
-            &linked_docs,
-            git_tree.as_ref(),
-        );
-        if !diagnostics.is_empty() {
-            file_errors.push(FileError {
-                path: path.to_path_buf(),
-                diagnostics,
-            });
-        }
-    }
-
+    file_errors.extend(parallel_errors);
     Ok(file_errors)
 }
 
@@ -157,17 +174,28 @@ pub fn check_dir(root: &Path) -> Result<Vec<FileError>> {
 
 /// Format a single file. Returns `Ok(Some(changed))` if the file is covered by
 /// a schema, `Ok(None)` if it has no applicable schema.
+#[allow(clippy::too_many_arguments)]
 fn format_file(
     path: &Path,
     root: &Path,
     schemas: &HashMap<PathBuf, Schema>,
     matchers: &HashMap<PathBuf, PathMatcher>,
     linked_docs: &HashMap<PathBuf, LinkedDocInfo>,
+    doc_cache: &HashMap<PathBuf, (String, Document)>,
     git_tree: Option<&std::collections::HashSet<PathBuf>>,
     opts: FormatOptions,
 ) -> Result<Option<bool>> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    // Use the preloaded content+doc if available; otherwise read from disk.
+    // For format mode we always need an owned (mutable) Document for fix
+    // application, so we clone the cached doc rather than re-parsing from disk.
+    let (content, mut doc) = if let Some((cached_content, cached_doc)) = doc_cache.get(path) {
+        (cached_content.clone(), cached_doc.clone())
+    } else {
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let doc = parse(&content);
+        (content, doc)
+    };
 
     let file_size = content.len();
     let rel = path.strip_prefix(root).unwrap_or(path);
@@ -175,8 +203,6 @@ fn format_file(
         debug!(file = %rel.display(), "no schema covers file, skipping");
         return Ok(None);
     };
-
-    let mut doc = parse(&content);
 
     // Resolve type: explicit frontmatter `type:` takes priority, then path patterns.
     let resolved = resolve_type(path, &doc, schema, &schema_dir, matchers);
@@ -198,16 +224,13 @@ fn format_file(
         }
     }
 
-    let docs_slice: Vec<&LinkedDocInfo> = linked_docs.values().collect();
-    let docs_owned: Vec<LinkedDocInfo> = docs_slice.into_iter().cloned().collect();
-
     let mut diagnostics = match &resolved {
         ResolvedType::Explicit(name, type_def) | ResolvedType::PathMatched(name, type_def) => {
             let ctx = ValidateCtx {
                 source_path: path,
                 source_type: name,
                 schema,
-                linked_docs: &docs_owned,
+                linked_docs,
                 git_tree,
             };
             let mut diags = validate(&doc, type_def, &ctx, Some(file_size));
@@ -316,15 +339,54 @@ fn check_file(
     schemas: &HashMap<PathBuf, Schema>,
     matchers: &HashMap<PathBuf, PathMatcher>,
     linked_docs: &HashMap<PathBuf, LinkedDocInfo>,
+    doc_cache: &HashMap<PathBuf, (String, Document)>,
     git_tree: Option<&std::collections::HashSet<PathBuf>>,
 ) -> Vec<Diagnostic> {
+    // Fast path: reuse the preloaded (content, doc) — no disk I/O or re-parse.
+    if let Some((content, doc)) = doc_cache.get(path) {
+        return check_document(
+            path,
+            content,
+            doc,
+            root,
+            schemas,
+            matchers,
+            linked_docs,
+            git_tree,
+        );
+    }
+    // Slow path: file wasn't preloaded (shouldn't happen for files under a schema).
     let Ok(content) = std::fs::read_to_string(path) else {
         return vec![Diagnostic::UnknownType {
             line: 0,
             message: "could not read file".to_string(),
         }];
     };
+    let doc = parse(&content);
+    check_document(
+        path,
+        &content,
+        &doc,
+        root,
+        schemas,
+        matchers,
+        linked_docs,
+        git_tree,
+    )
+}
 
+/// Inner check logic operating on already-loaded content and document.
+#[allow(clippy::too_many_arguments)]
+fn check_document(
+    path: &Path,
+    content: &str,
+    doc: &Document,
+    root: &Path,
+    schemas: &HashMap<PathBuf, Schema>,
+    matchers: &HashMap<PathBuf, PathMatcher>,
+    linked_docs: &HashMap<PathBuf, LinkedDocInfo>,
+    git_tree: Option<&std::collections::HashSet<PathBuf>>,
+) -> Vec<Diagnostic> {
     let rel = path.strip_prefix(root).unwrap_or(path);
     let file_size = content.len();
     let Some((schema, schema_dir)) = find_schema_for(path, root, schemas) else {
@@ -332,9 +394,7 @@ fn check_file(
         return vec![];
     };
 
-    let doc = parse(&content);
-
-    let resolved = resolve_type(path, &doc, schema, &schema_dir, matchers);
+    let resolved = resolve_type(path, doc, schema, &schema_dir, matchers);
     match &resolved {
         ResolvedType::Explicit(name, _) => {
             debug!(file = %rel.display(), r#type = name, "explicit type from frontmatter");
@@ -353,18 +413,16 @@ fn check_file(
         }
     }
 
-    let docs_owned: Vec<LinkedDocInfo> = linked_docs.values().cloned().collect();
-
     let mut diagnostics = match &resolved {
         ResolvedType::Explicit(name, type_def) | ResolvedType::PathMatched(name, type_def) => {
             let ctx = ValidateCtx {
                 source_path: path,
                 source_type: name,
                 schema,
-                linked_docs: &docs_owned,
+                linked_docs,
                 git_tree,
             };
-            let mut diags = validate(&doc, type_def, &ctx, Some(file_size));
+            let mut diags = validate(doc, type_def, &ctx, Some(file_size));
             if matches!(&resolved, ResolvedType::PathMatched(..)) {
                 suppress_type_field_requirement(&mut diags);
             }
@@ -380,7 +438,7 @@ fn check_file(
                 ),
             }]
         }
-        ResolvedType::Unknown => validate_unknown_type(&doc, schema),
+        ResolvedType::Unknown => validate_unknown_type(doc, schema),
     };
 
     // Suppress MissingFrontmatter for path-matched files with no required fields
@@ -388,7 +446,7 @@ fn check_file(
         suppress_missing_frontmatter(&mut diagnostics, &resolved);
     }
 
-    diagnostics.extend(detect_malformed_links(&content));
+    diagnostics.extend(detect_malformed_links(content));
     diagnostics
 }
 
@@ -401,7 +459,7 @@ fn check_file(
 ///
 /// Schema load errors are pushed into `result.errors`.
 /// Returns both the loaded schemas and compiled path matchers.
-fn load_all_schemas(
+pub(crate) fn load_all_schemas(
     root: &Path,
     result: &mut FormatResult,
 ) -> (HashMap<PathBuf, Schema>, HashMap<PathBuf, PathMatcher>) {
@@ -497,7 +555,7 @@ fn load_all_schemas(
 }
 
 /// Find the nearest schema covering `path` (search up to `root`).
-fn find_schema_for<'a>(
+pub(crate) fn find_schema_for<'a>(
     path: &Path,
     root: &Path,
     schemas: &'a HashMap<PathBuf, Schema>,
@@ -521,12 +579,20 @@ fn find_schema_for<'a>(
 /// Read every `.md` file under directories covered by a schema and extract its
 /// doc type + per-section link URLs. This is passed to validate() so
 /// bidirectional link checks need no I/O during validation.
+///
+/// Also returns a doc cache: `abs_path → (raw_content, parsed Document)`.
+/// The main file loop uses this cache to avoid re-reading and re-parsing every
+/// file, cutting I/O and parse work roughly in half.
 fn preload_linked_docs(
     root: &Path,
     schemas: &HashMap<PathBuf, Schema>,
     matchers: &HashMap<PathBuf, PathMatcher>,
-) -> HashMap<PathBuf, LinkedDocInfo> {
-    let mut map: HashMap<PathBuf, LinkedDocInfo> = HashMap::new();
+) -> (
+    HashMap<PathBuf, LinkedDocInfo>,
+    HashMap<PathBuf, (String, Document)>,
+) {
+    let mut linked: HashMap<PathBuf, LinkedDocInfo> = HashMap::new();
+    let mut doc_cache: HashMap<PathBuf, (String, Document)> = HashMap::new();
 
     let walker = WalkDir::new(root)
         .into_iter()
@@ -589,17 +655,20 @@ fn preload_linked_docs(
             }
         }
 
-        map.insert(
-            abs,
+        linked.insert(
+            abs.clone(),
             LinkedDocInfo {
                 path: path.to_path_buf(),
                 doc_type,
                 section_links,
             },
         );
+
+        // Cache the parsed content+doc so the main loop can skip re-read/re-parse.
+        doc_cache.insert(abs, (content, doc));
     }
 
-    map
+    (linked, doc_cache)
 }
 
 // ── Link extraction ───────────────────────────────────────────────────────────
@@ -661,7 +730,7 @@ fn collect_inline_links(inlines: &[crate::ast::Inline], links: &mut Vec<String>)
 // ── Type resolution ───────────────────────────────────────────────────────────
 
 /// Result of resolving a file's document type.
-enum ResolvedType<'a> {
+pub(crate) enum ResolvedType<'a> {
     /// Frontmatter `type:` matched a schema type (highest priority).
     Explicit(String, &'a crate::schema::TypeDef),
     /// No `type:` in frontmatter, but file path matched a schema's `paths:` patterns.
@@ -675,7 +744,7 @@ enum ResolvedType<'a> {
 }
 
 /// Resolve a file's type: frontmatter `type:` takes priority, then path patterns.
-fn resolve_type<'a>(
+pub(crate) fn resolve_type<'a>(
     path: &Path,
     doc: &crate::ast::Document,
     schema: &'a Schema,
@@ -767,10 +836,11 @@ fn suppress_missing_frontmatter(diagnostics: &mut Vec<Diagnostic>, resolved: &Re
 /// Walk up from `start` to find the nearest directory containing `.typedown/`.
 ///
 /// Returns the parent of `.typedown/`, not the `.typedown/` dir itself.
-/// Used by the LSP to determine the project root from a file path.
+/// Used by the LSP and CLI to determine the project root from a file path.
 ///
-/// Falls back to `start`'s directory when no `.typedown/` is found, so
-/// preset-only projects still get a usable root.
+/// Stops walking at the nearest `.git` directory to avoid escaping the current
+/// repository. Falls back to `start`'s directory when no `.typedown/` is found
+/// within the repo boundary, so preset-only projects still get a usable root.
 pub(crate) fn find_project_root(start: &Path) -> Option<PathBuf> {
     let start_dir = if start.is_file() {
         start.parent()?
@@ -778,26 +848,32 @@ pub(crate) fn find_project_root(start: &Path) -> Option<PathBuf> {
         start
     };
     let mut dir = start_dir;
+    let mut git_boundary: Option<&Path> = None;
     loop {
         if dir.join(SCHEMA_DIR).is_dir() {
             return Some(dir.to_path_buf());
+        }
+        // Record the git root but keep walking -- .typedown/ may be above .git/
+        // in a monorepo layout. We only use it as the fallback boundary.
+        if git_boundary.is_none() && dir.join(".git").exists() {
+            git_boundary = Some(dir);
         }
         match dir.parent() {
             Some(parent) => dir = parent,
             None => break,
         }
     }
-    // Fallback: use start directory for preset-only projects.
-    Some(start_dir.to_path_buf())
+    // Fallback: stop at git boundary if found, otherwise use start directory.
+    Some(git_boundary.unwrap_or(start_dir).to_path_buf())
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
-fn is_markdown(path: &Path) -> bool {
+pub(crate) fn is_markdown(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("md")
 }
 
-fn is_ignored(name: &str) -> bool {
+pub(crate) fn is_ignored(name: &str) -> bool {
     matches!(name, "node_modules" | ".git" | "target")
 }
 
@@ -807,7 +883,14 @@ fn is_ignored(name: &str) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// Serialize tests that mutate `XDG_CONFIG_HOME`.  Rust's test harness runs
+    /// tests in parallel; `set_var`/`remove_var` are not thread-safe, so
+    /// concurrent mutations cause spurious failures in sandboxed environments
+    /// (e.g. Nix builds).
+    static XDG_LOCK: Mutex<()> = Mutex::new(());
 
     fn make_tree(files: &[(&str, &str)]) -> TempDir {
         let dir = TempDir::new().unwrap();
@@ -825,10 +908,12 @@ mod tests {
     fn test_format_dir_no_schema_no_changes() {
         // Isolate from real XDG presets on the developer's machine.
         let xdg_dir = TempDir::new().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
         let dir = make_tree(&[("notes/hello.md", "# Hello\n\nJust a note.\n")]);
+        let _guard = XDG_LOCK.lock().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
         let result = format_dir(dir.path(), FormatOptions::default()).unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
+        drop(_guard);
         assert_eq!(result.files_changed, 0);
         assert!(result.errors.is_empty());
     }
@@ -904,10 +989,12 @@ mod tests {
     fn test_check_dir_no_schema_no_errors() {
         // Isolate from real XDG presets on the developer's machine.
         let xdg_dir = TempDir::new().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
         let dir = make_tree(&[("notes/hello.md", "# Hello\n")]);
+        let _guard = XDG_LOCK.lock().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
         let errors = check_dir(dir.path()).unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
+        drop(_guard);
         assert!(errors.is_empty());
     }
 
@@ -1290,9 +1377,11 @@ mod tests {
             ("README.md", "# test-presets-merged-into-project-schema\n"),
         ]);
 
+        let _guard = XDG_LOCK.lock().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
         let errors = check_dir(dir.path()).unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
+        drop(_guard);
 
         // README.md should be validated by the preset readme type (no errors)
         assert!(
@@ -1322,9 +1411,11 @@ mod tests {
             ("README.md", "# test-project-local-overrides-preset\n"),
         ]);
 
+        let _guard = XDG_LOCK.lock().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
         let errors = check_dir(dir.path()).unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
+        drop(_guard);
 
         // Should pass: project-local readme wins, no `description` required
         assert!(
@@ -1349,9 +1440,11 @@ mod tests {
         // No .typedown/ dir in the project
         let dir = make_tree(&[("README.md", "# Hello\n")]);
 
+        let _guard = XDG_LOCK.lock().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
         let errors = check_dir(dir.path()).unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
+        drop(_guard);
 
         // Presets should validate: README.md is missing required `created` field
         assert!(

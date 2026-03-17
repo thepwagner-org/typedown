@@ -3,6 +3,7 @@ mod cli;
 mod fix;
 mod format;
 mod git;
+mod json;
 mod lsp;
 mod parse;
 mod schema;
@@ -28,7 +29,8 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = format::find_project_root(&cwd).unwrap_or_else(|| cwd.clone());
 
     match cli.command {
         cli::Command::Fmt => {
@@ -79,6 +81,17 @@ fn main() {
         cli::Command::Lsp => {
             if let Err(e) = lsp::run() {
                 eprintln!("LSP error: {e}");
+                std::process::exit(1);
+            }
+        }
+
+        cli::Command::Json {
+            paths,
+            pretty,
+            depth,
+        } => {
+            if let Err(e) = json::json_output(&root, &cwd, &paths, pretty, depth) {
+                eprintln!("error: {e}");
                 std::process::exit(1);
             }
         }

@@ -1,0 +1,33 @@
+description: >-
+  Test schema for the properties feature. A hardware inventory document.
+  Each component item's sub-list is validated as typed properties: make
+  (string, required), model (string, required), quantity (integer, required),
+  category (enum, required), and cost (integer, optional). Exercises
+  case-insensitive key matching, required vs optional properties, and
+  integer/enum coercion in td json output.
+paths:
+  - "test-docs/hardware/*.md"
+
+structure:
+  title: from_filename
+  strict_sections: true
+  sections:
+    - title: Components
+      required: true
+      bullets: unordered
+      properties:
+        make:
+          type: string
+          required: true
+        model:
+          type: string
+          required: true
+        quantity:
+          type: integer
+          required: true
+        category:
+          type: enum
+          required: true
+          values: [storage, compute, networking, memory, power]
+        cost:
+          type: integer

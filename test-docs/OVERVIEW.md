@@ -21,6 +21,8 @@ version: "1.0"
 - **Date headings**: oldest_first sort (chronological log)
 - **Intro section**: structure-level intro between H1 and first H2 (this file)
 - **Size warning**: enforced on feature docs (2000 byte limit)
+- **JSON output**: td json, frontmatter coercion, JSONL aggregation with jq
+- **Properties**: section-level key-value property maps, typed sub-items, td json coercion (test-hardware schema + hardware/homelab.md)
 
 ## Running the Suite
 

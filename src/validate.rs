@@ -3,7 +3,11 @@
 //! Takes `&Document` + `&TypeDef` (and optionally pre-loaded link data), returns
 //! `Vec<Diagnostic>`. No filesystem access, no I/O, no thread-local caches.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 use crate::{
     ast::{inlines_to_markdown, inlines_to_string, Block, Document, Frontmatter, Inline, ListItem},
@@ -291,7 +295,7 @@ pub struct ValidateCtx<'a> {
     /// Full schema (for type lookups).
     pub schema: &'a Schema,
     /// Pre-loaded info about linked documents (for link target + backlink checks).
-    pub linked_docs: &'a [LinkedDocInfo],
+    pub linked_docs: &'a HashMap<PathBuf, LinkedDocInfo>,
     /// Pre-loaded set of all git-tracked absolute paths (for cross-project links).
     pub git_tree: Option<&'a std::collections::HashSet<PathBuf>>,
 }
@@ -309,12 +313,14 @@ pub struct ValidateCtx<'a> {
 pub fn detect_malformed_links(content: &str) -> Vec<Diagnostic> {
     use regex::Regex;
 
+    // Compiled once per process via OnceLock.
+    static MALFORMED_LINK_RE: OnceLock<Regex> = OnceLock::new();
+
     // `[text](url-containing-a-space-or-tab)`
     // Capture group 2 is the URL portion, which must contain at least one
     // space or horizontal tab.
-    let Ok(re) = Regex::new(r"\[([^\]]+)\]\(([^)]*[ \t][^)]*)\)") else {
-        return vec![];
-    };
+    let re =
+        MALFORMED_LINK_RE.get_or_init(|| Regex::new(r"\[([^\]]+)\]\(([^)]*[ \t][^)]*)\)").unwrap());
 
     let mut out = Vec::new();
     let mut in_frontmatter = false;
@@ -479,86 +485,112 @@ fn validate_fields(fm: &Frontmatter, type_def: &TypeDef, out: &mut Vec<Diagnosti
     }
 }
 
+/// Returns `Some(error_message)` if `value` fails the type check for the given
+/// scalar field type. Does NOT recurse into `FieldType::List` items — callers
+/// handle those themselves.
+///
+/// `allow_null`: when true, a YAML null value is silently accepted (frontmatter
+/// fields are optional by default). Use `false` for list items and properties.
+fn check_typed_value(
+    value: &serde_yaml::Value,
+    field_type: &FieldType,
+    enum_values: Option<&[String]>,
+    allow_null: bool,
+) -> Option<String> {
+    use serde_yaml::Value;
+    let null_ok = allow_null && matches!(value, Value::Null);
+    match field_type {
+        FieldType::String | FieldType::Link => {
+            if !value.is_string() && !null_ok {
+                return Some("must be a string".to_string());
+            }
+        }
+        FieldType::Date => match value {
+            Value::String(s) => {
+                if parse_date(s).is_none() {
+                    return Some(format!("must be a valid date (got '{s}')"));
+                }
+            }
+            _ if null_ok => {}
+            _ => return Some("must be a date string".to_string()),
+        },
+        FieldType::Datetime => match value {
+            Value::String(s) => {
+                if parse_datetime(s).is_none() {
+                    return Some(format!("must be a valid datetime (got '{s}')"));
+                }
+            }
+            _ if null_ok => {}
+            _ => return Some("must be a datetime string".to_string()),
+        },
+        FieldType::Integer => {
+            if !value.is_i64() && !value.is_u64() && !null_ok {
+                return Some("must be an integer".to_string());
+            }
+        }
+        FieldType::Bool => {
+            if !value.is_bool() && !null_ok {
+                return Some("must be a boolean".to_string());
+            }
+        }
+        FieldType::Enum => {
+            if let Some(valid) = enum_values {
+                match value {
+                    Value::String(s) => {
+                        if !valid.contains(s) {
+                            return Some(format!(
+                                "must be one of: {} (got '{s}')",
+                                valid.join(", ")
+                            ));
+                        }
+                    }
+                    _ if null_ok => {}
+                    _ => return Some("must be a string enum value".to_string()),
+                }
+            }
+        }
+        FieldType::List => {} // callers handle list recursion
+    }
+    None
+}
+
 fn validate_field_type(
     field_name: &str,
     value: &serde_yaml::Value,
     field_def: &FieldDef,
     out: &mut Vec<Diagnostic>,
 ) {
-    use serde_yaml::Value;
-
-    let bad = |msg: &str| Diagnostic::InvalidFieldType {
-        line: 1,
-        field: field_name.to_string(),
-        message: msg.to_string(),
-    };
-
-    match field_def.field_type {
-        FieldType::String => {
-            if !value.is_string() && !matches!(value, Value::Null) {
-                out.push(bad("must be a string"));
-            }
-        }
-        FieldType::Date => match value {
-            Value::String(s) => {
-                if parse_date(s).is_none() {
-                    out.push(bad(&format!("must be a valid date (got '{s}')")));
-                }
-            }
-            Value::Null => {}
-            _ => out.push(bad("must be a date string")),
-        },
-        FieldType::Datetime => match value {
-            Value::String(s) => {
-                if parse_datetime(s).is_none() {
-                    out.push(bad(&format!("must be a valid datetime (got '{s}')")));
-                }
-            }
-            Value::Null => {}
-            _ => out.push(bad("must be a datetime string")),
-        },
-        FieldType::Integer => {
-            if !value.is_i64() && !value.is_u64() && !matches!(value, Value::Null) {
-                out.push(bad("must be an integer"));
-            }
-        }
-        FieldType::Bool => {
-            if !value.is_bool() && !matches!(value, Value::Null) {
-                out.push(bad("must be a boolean"));
-            }
-        }
-        FieldType::Enum => {
-            if let Some(valid) = &field_def.values {
-                match value {
-                    Value::String(s) => {
-                        if !valid.contains(s) {
-                            out.push(bad(&format!(
-                                "must be one of: {} (got '{s}')",
-                                valid.join(", ")
-                            )));
-                        }
-                    }
-                    Value::Null => {}
-                    _ => out.push(bad("must be a string enum value")),
-                }
-            }
-        }
-        FieldType::Link => {
-            if !value.is_string() && !matches!(value, Value::Null) {
-                out.push(bad("must be a link string"));
-            }
-        }
-        FieldType::List => match value {
-            Value::Sequence(seq) => {
+    // List fields need special handling: check outer sequence, then recurse into items.
+    if field_def.field_type == FieldType::List {
+        match value {
+            serde_yaml::Value::Sequence(seq) => {
                 if let Some(item_type) = &field_def.item_type {
                     for (i, item) in seq.iter().enumerate() {
                         validate_list_item(field_name, i, item, item_type, field_def, out);
                     }
                 }
             }
-            Value::Null => {}
-            _ => out.push(bad("must be a list")),
-        },
+            serde_yaml::Value::Null => {}
+            _ => out.push(Diagnostic::InvalidFieldType {
+                line: 1,
+                field: field_name.to_string(),
+                message: "must be a list".to_string(),
+            }),
+        }
+        return;
+    }
+
+    if let Some(msg) = check_typed_value(
+        value,
+        &field_def.field_type,
+        field_def.values.as_deref(),
+        true,
+    ) {
+        out.push(Diagnostic::InvalidFieldType {
+            line: 1,
+            field: field_name.to_string(),
+            message: msg,
+        });
     }
 }
 
@@ -570,70 +602,23 @@ fn validate_list_item(
     field_def: &FieldDef,
     out: &mut Vec<Diagnostic>,
 ) {
-    use serde_yaml::Value;
-
     let item_name = format!("{field_name}[{index}]");
-    let bad = |msg: &str| Diagnostic::InvalidFieldType {
-        line: 1,
-        field: item_name.clone(),
-        message: msg.to_string(),
-    };
 
-    match item_type {
-        FieldType::String => {
-            if !item.is_string() {
-                out.push(bad("must be a string"));
-            }
-        }
-        FieldType::Date => match item {
-            Value::String(s) => {
-                if parse_date(s).is_none() {
-                    out.push(bad(&format!("must be a valid date (got '{s}')")));
-                }
-            }
-            _ => out.push(bad("must be a date string")),
-        },
-        FieldType::Datetime => match item {
-            Value::String(s) => {
-                if parse_datetime(s).is_none() {
-                    out.push(bad(&format!("must be a valid datetime (got '{s}')")));
-                }
-            }
-            _ => out.push(bad("must be a datetime string")),
-        },
-        FieldType::Integer => {
-            if !item.is_i64() && !item.is_u64() {
-                out.push(bad("must be an integer"));
-            }
-        }
-        FieldType::Bool => {
-            if !item.is_bool() {
-                out.push(bad("must be a boolean"));
-            }
-        }
-        FieldType::Enum => {
-            if let Some(valid) = &field_def.values {
-                match item {
-                    Value::String(s) => {
-                        if !valid.contains(s) {
-                            out.push(bad(&format!(
-                                "must be one of: {} (got '{s}')",
-                                valid.join(", ")
-                            )));
-                        }
-                    }
-                    _ => out.push(bad("must be a string enum value")),
-                }
-            }
-        }
-        FieldType::Link => {
-            if !item.is_string() {
-                out.push(bad("must be a link string"));
-            }
-        }
-        FieldType::List => {
-            out.push(bad("nested lists are not supported"));
-        }
+    if *item_type == FieldType::List {
+        out.push(Diagnostic::InvalidFieldType {
+            line: 1,
+            field: item_name,
+            message: "nested lists are not supported".to_string(),
+        });
+        return;
+    }
+
+    if let Some(msg) = check_typed_value(item, item_type, field_def.values.as_deref(), false) {
+        out.push(Diagnostic::InvalidFieldType {
+            line: 1,
+            field: item_name,
+            message: msg,
+        });
     }
 }
 
@@ -1189,7 +1174,118 @@ fn validate_section_content(
         if let Some(ref links_def) = section_def.links {
             validate_section_links(section_blocks, *heading_line, links_def, ctx, out);
         }
+
+        // Property validation for sections that declare a property map
+        if let Some(ref properties_def) = section_def.properties {
+            validate_section_properties(
+                section_blocks,
+                properties_def,
+                *heading_line,
+                section_title,
+                out,
+            );
+        }
     }
+}
+
+// ── Property validation ───────────────────────────────────────────────────────
+
+/// Validate all top-level list items in a section against the declared property map.
+fn validate_section_properties(
+    section_blocks: &[Block],
+    properties_def: &indexmap::IndexMap<String, FieldDef>,
+    heading_line: usize,
+    section_title: &str,
+    out: &mut Vec<Diagnostic>,
+) {
+    for block in section_blocks {
+        if let Block::List { items, .. } = block {
+            for item in items {
+                validate_item_properties(item, properties_def, heading_line, section_title, out);
+            }
+        }
+    }
+}
+
+/// Validate the sub-items of a single list item as key-value properties.
+fn validate_item_properties(
+    item: &ListItem,
+    properties_def: &indexmap::IndexMap<String, FieldDef>,
+    heading_line: usize,
+    section_title: &str,
+    out: &mut Vec<Diagnostic>,
+) {
+    // Collect all key-value pairs from child lists
+    let mut found: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for child in &item.children {
+        if let Block::List {
+            items: sub_items, ..
+        } = child
+        {
+            for sub_item in sub_items {
+                let text = inlines_to_string(&sub_item.content);
+                if let Some((k, v)) = text.split_once(": ") {
+                    found.insert(k.trim().to_lowercase(), v.trim().to_string());
+                }
+            }
+        }
+    }
+
+    for (prop_name, prop_def) in properties_def {
+        if let Some(value_str) = found.get(prop_name.as_str()) {
+            if let Some(msg) = validate_property_str(value_str, prop_def) {
+                out.push(Diagnostic::InvalidFieldType {
+                    line: heading_line,
+                    field: format!("{section_title}/{prop_name}"),
+                    message: msg,
+                });
+            }
+        } else if prop_def.required {
+            out.push(Diagnostic::MissingRequiredField {
+                line: heading_line,
+                field: format!("{section_title}/{prop_name}"),
+            });
+        }
+    }
+}
+
+/// Validate a property value expressed as a plain string (from inline markdown content).
+/// Returns `Some(error_message)` if invalid.
+fn validate_property_str(value: &str, field_def: &FieldDef) -> Option<String> {
+    match field_def.field_type {
+        FieldType::Integer => {
+            if value.parse::<i64>().is_err() && value.parse::<u64>().is_err() {
+                return Some(format!("must be an integer (got '{value}')"));
+            }
+        }
+        FieldType::Bool => match value.to_lowercase().as_str() {
+            "true" | "false" | "yes" | "no" => {}
+            _ => return Some(format!("must be a boolean (got '{value}')")),
+        },
+        FieldType::Date => {
+            if parse_date(value).is_none() {
+                return Some(format!("must be a valid date (got '{value}')"));
+            }
+        }
+        FieldType::Datetime => {
+            if parse_datetime(value).is_none() {
+                return Some(format!("must be a valid datetime (got '{value}')"));
+            }
+        }
+        FieldType::Enum => {
+            if let Some(valid) = &field_def.values {
+                if !valid.contains(&value.to_string()) {
+                    return Some(format!(
+                        "must be one of: {} (got '{value}')",
+                        valid.join(", ")
+                    ));
+                }
+            }
+        }
+        FieldType::String | FieldType::Link => {}
+        FieldType::List => return Some("list type not supported for properties".to_string()),
+    }
+    None
 }
 
 fn validate_item_template(
@@ -1512,7 +1608,7 @@ fn validate_all_links(doc: &Document, ctx: &ValidateCtx<'_>, out: &mut Vec<Diagn
         let Some(target) = resolve_link_path(&url, ctx.source_path) else {
             continue;
         };
-        let in_linked = ctx.linked_docs.iter().any(|d| d.path == target);
+        let in_linked = ctx.linked_docs.contains_key(&target);
         let in_git = ctx.git_tree.is_some_and(|t| t.contains(&target));
         if !in_linked && !in_git {
             out.push(Diagnostic::UnknownType {
@@ -1599,23 +1695,23 @@ pub fn resolve_link_path(link: &str, source_path: &Path) -> Option<PathBuf> {
 
 /// Simple percent-decoding for URL path components (e.g. `%20` → space).
 fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
                 if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                    out.push(byte as char);
+                    out.push(byte);
                     i += 3;
                     continue;
                 }
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).to_string())
 }
 
 /// Normalize a path (resolve `..` and `.` without touching the filesystem).
@@ -1652,7 +1748,7 @@ fn validate_section_links(
             continue;
         };
 
-        let linked = ctx.linked_docs.iter().find(|d| d.path == target_path);
+        let linked = ctx.linked_docs.get(&target_path);
 
         // target_type constraint
         if let Some(ref expected_type) = links_def.target_type {
@@ -1838,12 +1934,17 @@ mod tests {
         Path::new("test.md")
     }
 
+    fn empty_linked_docs() -> &'static HashMap<PathBuf, LinkedDocInfo> {
+        static EMPTY: OnceLock<HashMap<PathBuf, LinkedDocInfo>> = OnceLock::new();
+        EMPTY.get_or_init(HashMap::new)
+    }
+
     /// Convenience: build a ValidateCtx for tests (no git tree, empty linked_docs by default).
     fn make_ctx<'a>(
         source_type: &'a str,
         source_path: &'a Path,
         schema: &'a Schema,
-        linked_docs: &'a [LinkedDocInfo],
+        linked_docs: &'a HashMap<PathBuf, LinkedDocInfo>,
     ) -> ValidateCtx<'a> {
         ValidateCtx {
             source_path,
@@ -1863,7 +1964,7 @@ mod tests {
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("note", empty_path(), &schema, &[]),
+            &make_ctx("note", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -1881,7 +1982,7 @@ mod tests {
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("note", empty_path(), &schema, &[]),
+            &make_ctx("note", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -1902,7 +2003,7 @@ mod tests {
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("person", empty_path(), &schema, &[]),
+            &make_ctx("person", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(diags.is_empty(), "expected no errors, got: {diags:?}");
@@ -1918,7 +2019,7 @@ mod tests {
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("person", empty_path(), &schema, &[]),
+            &make_ctx("person", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -1939,7 +2040,7 @@ mod tests {
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -1960,7 +2061,7 @@ mod tests {
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("show", empty_path(), &schema, &[]),
+            &make_ctx("show", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -1979,7 +2080,7 @@ mod tests {
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("show", empty_path(), &schema, &[]),
+            &make_ctx("show", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(diags.is_empty(), "got: {diags:?}");
@@ -1995,7 +2096,7 @@ mod tests {
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(diags.is_empty(), "got: {diags:?}");
@@ -2011,7 +2112,7 @@ mod tests {
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2027,7 +2128,12 @@ mod tests {
         let (schema, type_def) = make_schema("page", "structure:\n  title: from_filename\n");
         let doc = parse("---\ntype: page\n---\n# my-page\n");
         let path = Path::new("my-page.md");
-        let diags = validate(&doc, &type_def, &make_ctx("page", path, &schema, &[]), None);
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("page", path, &schema, empty_linked_docs()),
+            None,
+        );
         assert!(diags.is_empty(), "got: {diags:?}");
     }
 
@@ -2036,7 +2142,12 @@ mod tests {
         let (schema, type_def) = make_schema("page", "structure:\n  title: from_filename\n");
         let doc = parse("---\ntype: page\n---\n# wrong title\n");
         let path = Path::new("my-page.md");
-        let diags = validate(&doc, &type_def, &make_ctx("page", path, &schema, &[]), None);
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("page", path, &schema, empty_linked_docs()),
+            None,
+        );
         assert!(
             diags
                 .iter()
@@ -2052,7 +2163,7 @@ mod tests {
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2070,7 +2181,7 @@ mod tests {
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2096,7 +2207,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2120,7 +2231,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2145,7 +2256,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2170,7 +2281,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2194,7 +2305,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(diags.is_empty(), "got: {diags:?}");
@@ -2213,7 +2324,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2237,7 +2348,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2262,7 +2373,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2288,7 +2399,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2349,12 +2460,13 @@ structure:
             doc_type: Some("other".to_string()),
             section_links: Default::default(),
         };
+        let linked_docs = HashMap::from([(linked.path.clone(), linked)]);
 
         let doc = parse("---\ntype: task\n---\n## Related\n\n- [Target](target.md)\n");
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("task", source_path, &schema, &[linked]),
+            &make_ctx("task", source_path, &schema, &linked_docs),
             None,
         );
         assert!(
@@ -2386,7 +2498,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("t", empty_path(), &schema, &[]),
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
             Some(100),
         );
         assert!(
@@ -2421,7 +2533,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("journal", path, &schema, &[]),
+            &make_ctx("journal", path, &schema, empty_linked_docs()),
             None,
         );
         // No link validation on this small doc, no other issues
@@ -2445,7 +2557,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("journal", path, &schema, &[]),
+            &make_ctx("journal", path, &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2464,7 +2576,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("journal", path, &schema, &[]),
+            &make_ctx("journal", path, &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2488,7 +2600,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("journal", path, &schema, &[]),
+            &make_ctx("journal", path, &schema, empty_linked_docs()),
             None,
         );
         let date_diags: Vec<_> = diags
@@ -2514,7 +2626,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("journal", path, &schema, &[]),
+            &make_ctx("journal", path, &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2535,7 +2647,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("journal", path, &schema, &[]),
+            &make_ctx("journal", path, &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2558,7 +2670,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("journal", path, &schema, &[]),
+            &make_ctx("journal", path, &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2581,7 +2693,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("journal", path, &schema, &[]),
+            &make_ctx("journal", path, &schema, empty_linked_docs()),
             None,
         );
         let order_diags: Vec<_> = diags
@@ -2663,7 +2775,12 @@ structure:
         let (schema, type_def) = make_schema("doc", yaml);
         let doc = parse("---\ntype: doc\n---\n# Title\n\n## Notes\n");
         let path = Path::new("test.md");
-        let diags = validate(&doc, &type_def, &make_ctx("doc", path, &schema, &[]), None);
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("doc", path, &schema, empty_linked_docs()),
+            None,
+        );
         assert!(
             diags
                 .iter()
@@ -2678,7 +2795,12 @@ structure:
         let (schema, type_def) = make_schema("doc", yaml);
         let doc = parse("---\ntype: doc\n---\n# Title\n\n## Notes\n\nSome content here.\n");
         let path = Path::new("test.md");
-        let diags = validate(&doc, &type_def, &make_ctx("doc", path, &schema, &[]), None);
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("doc", path, &schema, empty_linked_docs()),
+            None,
+        );
         assert!(
             !diags
                 .iter()
@@ -2694,7 +2816,12 @@ structure:
         let (schema, type_def) = make_schema("doc", yaml);
         let doc = parse("---\ntype: doc\n---\n# Title\n\n## Goals\n");
         let path = Path::new("test.md");
-        let diags = validate(&doc, &type_def, &make_ctx("doc", path, &schema, &[]), None);
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("doc", path, &schema, empty_linked_docs()),
+            None,
+        );
         assert!(
             !diags
                 .iter()
@@ -2741,7 +2868,12 @@ structure:
         let (schema, type_def) = make_schema("doc", yaml);
         let doc = parse("---\ntype: doc\n---\n# Title\n\nSee [this](missing.md).\n");
         let path = Path::new("/project/doc.md");
-        let diags = validate(&doc, &type_def, &make_ctx("doc", path, &schema, &[]), None);
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("doc", path, &schema, empty_linked_docs()),
+            None,
+        );
         assert!(
             diags
                 .iter()
@@ -2763,10 +2895,11 @@ structure:
             doc_type: None,
             section_links: Default::default(),
         };
+        let linked_docs = HashMap::from([(linked.path.clone(), linked)]);
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("doc", source_path, &schema, &[linked]),
+            &make_ctx("doc", source_path, &schema, &linked_docs),
             None,
         );
         assert!(
@@ -2785,7 +2918,12 @@ structure:
             "---\ntype: doc\n---\n# [Head](missing-head.md)\n\n> [Quote](missing-quote.md)\n\n| Col |\n| --- |\n| [Cell](missing-table.md) |\n\n![Alt](missing-image.png)\n",
         );
         let path = Path::new("/project/doc.md");
-        let diags = validate(&doc, &type_def, &make_ctx("doc", path, &schema, &[]), None);
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("doc", path, &schema, empty_linked_docs()),
+            None,
+        );
 
         for url in [
             "missing-head.md",
@@ -2819,7 +2957,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("doc", empty_path(), &schema, &[]),
+            &make_ctx("doc", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2838,7 +2976,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("doc", empty_path(), &schema, &[]),
+            &make_ctx("doc", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2857,7 +2995,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("doc", empty_path(), &schema, &[]),
+            &make_ctx("doc", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2878,7 +3016,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("doc", empty_path(), &schema, &[]),
+            &make_ctx("doc", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -2899,7 +3037,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("doc", empty_path(), &schema, &[]),
+            &make_ctx("doc", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         let field_errs: Vec<_> = diags
@@ -2942,6 +3080,7 @@ structure:
             doc_type: Some("person".to_string()),
             section_links,
         };
+        let linked_docs = HashMap::from([(linked_person.path.clone(), linked_person)]);
 
         let doc =
             parse("---\ntype: project\n---\n# My Project\n\n## Team\n\n- [Alice](person.md)\n");
@@ -2949,7 +3088,7 @@ structure:
             source_path: project_path,
             source_type: "project",
             schema: &schema,
-            linked_docs: &[linked_person],
+            linked_docs: &linked_docs,
             git_tree: None,
         };
         let diags = validate(&doc, &project_def, &ctx, None);
@@ -2984,6 +3123,7 @@ structure:
             doc_type: Some("person".to_string()),
             section_links: Default::default(), // empty — no backlink
         };
+        let linked_docs = HashMap::from([(linked_person.path.clone(), linked_person)]);
 
         let doc =
             parse("---\ntype: project\n---\n# My Project\n\n## Team\n\n- [Alice](person.md)\n");
@@ -2991,7 +3131,7 @@ structure:
             source_path: project_path,
             source_type: "project",
             schema: &schema,
-            linked_docs: &[linked_person],
+            linked_docs: &linked_docs,
             git_tree: None,
         };
         let diags = validate(&doc, &project_def, &ctx, None);
@@ -3022,6 +3162,7 @@ structure:
             doc_type: Some("person".to_string()), // type field present but not in schema
             section_links: Default::default(),
         };
+        let linked_docs = HashMap::from([(linked_person.path.clone(), linked_person)]);
 
         let doc =
             parse("---\ntype: project\n---\n# My Project\n\n## Team\n\n- [Alice](person.md)\n");
@@ -3029,7 +3170,7 @@ structure:
             source_path: project_path,
             source_type: "project",
             schema: &schema,
-            linked_docs: &[linked_person],
+            linked_docs: &linked_docs,
             git_tree: None,
         };
         let diags = validate(&doc, &project_def, &ctx, None);
@@ -3064,6 +3205,7 @@ structure:
             doc_type: Some("threat".to_string()),
             section_links: b_links,
         };
+        let linked_docs = HashMap::from([(linked_b.path.clone(), linked_b)]);
 
         let doc = parse(
             "---\ntype: threat\n---\n# Threat A\n\n## Leads To\n\n- [Threat B](threat-b.md)\n",
@@ -3072,7 +3214,7 @@ structure:
             source_path: a_path,
             source_type: "threat",
             schema: &schema,
-            linked_docs: &[linked_b],
+            linked_docs: &linked_docs,
             git_tree: None,
         };
         let diags = validate(&doc, &threat_def, &ctx, None);
@@ -3096,7 +3238,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("doc", empty_path(), &schema, &[]),
+            &make_ctx("doc", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -3124,7 +3266,7 @@ structure:
         let diags = validate(
             &doc,
             &type_def,
-            &make_ctx("doc", empty_path(), &schema, &[]),
+            &make_ctx("doc", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         // If the validator emits an update diagnostic, custom_content must be non-empty
@@ -3159,7 +3301,7 @@ structure:
         let diags_clean = validate(
             &doc_clean,
             &type_def,
-            &make_ctx("doc", empty_path(), &schema, &[]),
+            &make_ctx("doc", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -3176,7 +3318,7 @@ structure:
         let diags_drifted = validate(
             &doc_drifted,
             &type_def,
-            &make_ctx("doc", empty_path(), &schema, &[]),
+            &make_ctx("doc", empty_path(), &schema, empty_linked_docs()),
             None,
         );
         assert!(
@@ -3185,5 +3327,119 @@ structure:
                 .any(|d| matches!(d, Diagnostic::ManagedSectionNeedsUpdate { .. })),
             "word change in managed section body should trigger ManagedSectionNeedsUpdate"
         );
+    }
+
+    #[test]
+    fn test_percent_decode_ascii() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+        assert_eq!(percent_decode("no-encoding"), "no-encoding");
+        assert_eq!(percent_decode("a%2Fb"), "a/b");
+    }
+
+    #[test]
+    fn test_percent_decode_multibyte() {
+        // Em dash U+2014 encodes as %E2%80%94 in UTF-8.
+        assert_eq!(percent_decode("%E2%80%94"), "\u{2014}");
+        // Curly left double-quote U+201C encodes as %E2%80%9C.
+        assert_eq!(percent_decode("%E2%80%9C"), "\u{201C}");
+        // Mixed: ASCII + em dash + ASCII.
+        assert_eq!(percent_decode("a%E2%80%94b"), "a\u{2014}b");
+    }
+
+    // ── Property validation tests ─────────────────────────────────────────────
+
+    fn validate_props(doc_md: &str, props_yaml: &str) -> Vec<Diagnostic> {
+        let type_yaml = format!(
+            "structure:\n  sections:\n    - title: Media\n      bullets: unordered\n      properties:\n{props_yaml}"
+        );
+        let (schema, type_def) = make_schema("item", &type_yaml);
+        // Wrap in frontmatter so validate() doesn't short-circuit with MissingFrontmatter
+        let doc = parse(&format!("---\ntype: item\n---\n{doc_md}"));
+        let ctx = make_ctx("item", empty_path(), &schema, empty_linked_docs());
+        validate(&doc, &type_def, &ctx, None)
+    }
+
+    #[test]
+    fn test_properties_valid_passes() {
+        // Schema uses lowercase keys; document may use any case
+        let diags = validate_props(
+            "# Title\n\n## Media\n\n- Bluray\n  - Size: 42\n  - Audio: English\n",
+            "        size:\n          type: integer\n          required: true\n        audio:\n          type: string\n          required: true\n",
+        );
+        assert!(diags.is_empty(), "expected no errors, got: {diags:?}");
+    }
+
+    #[test]
+    fn test_properties_missing_required() {
+        let diags = validate_props(
+            "# Title\n\n## Media\n\n- Bluray\n  - Audio: English\n",
+            "        size:\n          type: integer\n          required: true\n        audio:\n          type: string\n",
+        );
+        assert!(
+            diags.iter().any(|d| matches!(d,
+                Diagnostic::MissingRequiredField { field, .. } if field.contains("size")
+            )),
+            "expected missing size, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_properties_invalid_integer() {
+        let diags = validate_props(
+            "# Title\n\n## Media\n\n- Bluray\n  - Size: not-a-number\n",
+            "        size:\n          type: integer\n          required: true\n",
+        );
+        assert!(
+            diags.iter().any(|d| matches!(d,
+                Diagnostic::InvalidFieldType { field, .. } if field.contains("size")
+            )),
+            "expected invalid integer for size, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_properties_invalid_enum() {
+        let diags = validate_props(
+            "# Title\n\n## Media\n\n- Bluray\n  - Format: webm\n",
+            "        format:\n          type: enum\n          required: true\n          values: [bluray, remux, web]\n",
+        );
+        assert!(
+            diags.iter().any(|d| matches!(d,
+                Diagnostic::InvalidFieldType { field, .. } if field.contains("format")
+            )),
+            "expected invalid enum for format, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_properties_optional_absent_ok() {
+        let diags = validate_props(
+            "# Title\n\n## Media\n\n- Bluray\n  - Size: 42\n",
+            "        size:\n          type: integer\n          required: true\n        subtitles:\n          type: string\n",
+        );
+        assert!(diags.is_empty(), "expected no errors, got: {diags:?}");
+    }
+
+    #[test]
+    fn test_properties_invalid_date() {
+        let diags = validate_props(
+            "# Title\n\n## Media\n\n- Bluray\n  - Released: yesterday\n",
+            "        released:\n          type: date\n          required: true\n",
+        );
+        assert!(
+            diags.iter().any(|d| matches!(d,
+                Diagnostic::InvalidFieldType { field, .. } if field.contains("released")
+            )),
+            "expected invalid date for released, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_properties_valid_date() {
+        let diags = validate_props(
+            "# Title\n\n## Media\n\n- Bluray\n  - Released: 2001-07-20\n",
+            "        released:\n          type: date\n          required: true\n",
+        );
+        assert!(diags.is_empty(), "expected no errors, got: {diags:?}");
     }
 }

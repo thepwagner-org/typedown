@@ -137,6 +137,11 @@
         "intro_text": {
           "type": "string",
           "description": "Required introductory paragraph prefix for this section. Auto-inserted by 'td fmt' if missing."
+        },
+        "properties": {
+          "type": "object",
+          "description": "Property map for top-level list items. Each item's sub-list is parsed as 'Key: Value' pairs and validated against these field definitions. Keys in the schema must be lowercase; document text may use any case (e.g. schema declares 'size', document can write 'Size: 42'). In 'td json' output, matched items gain a typed 'properties' object alongside the raw 'items' array. Delimiter is ': ' (colon-space).",
+          "additionalProperties": { "$ref": "#/$defs/field_def" }
         }
       }
     },

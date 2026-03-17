@@ -34,3 +34,4 @@ List fields check every item against the item type. Unknown fields are ignored.
 ## Related Features
 
 - [Section Structure](./section-structure.md)
+- [JSON Output](./json-output.md)

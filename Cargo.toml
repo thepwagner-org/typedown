@@ -23,6 +23,7 @@ lsp-server = "0.7"
 lsp-types = "0.97"
 globset = "0.4"
 walkdir = "2"
+rayon = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

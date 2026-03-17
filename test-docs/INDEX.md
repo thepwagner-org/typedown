@@ -10,6 +10,8 @@ updated: 2026-03-03
 - [Section Structure](./features/section-structure.md)
 - [Link Validation](./features/link-validation.md)
 - [Auto Fix](./features/auto-fix.md)
+- [JSON Output](./features/json-output.md)
+- [Properties](./features/properties.md)
 
 ## How This Works
 

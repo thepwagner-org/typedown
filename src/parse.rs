@@ -630,12 +630,24 @@ fn serialize_list(out: &mut String, items: &[ListItem], ordered: bool, indent: &
         out.push('\n');
         if !item.children.is_empty() {
             let child_indent = format!("{indent}   ");
-            serialize_blocks(out, &item.children, &child_indent);
+            write_blocks(out, &item.children, &child_indent);
         }
     }
 }
 
-fn serialize_blocks(out: &mut String, blocks: &[Block], indent: &str) {
+/// Serialize a slice of blocks to a markdown string (no frontmatter).
+///
+/// Used by `td json` to produce per-section `markdown` output.
+pub fn serialize_blocks(blocks: &[Block]) -> String {
+    let mut out = String::new();
+    write_blocks(&mut out, blocks, "");
+    while out.ends_with("\n\n\n") {
+        out.pop();
+    }
+    out
+}
+
+fn write_blocks(out: &mut String, blocks: &[Block], indent: &str) {
     for block in blocks {
         match block {
             Block::Heading { level, content, .. } => {

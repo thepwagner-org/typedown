@@ -20,7 +20,7 @@ fields:
   tags:
     type: list
     item_type: enum
-    values: [frontmatter, structure, links, formatting, auto-fix]
+    values: [frontmatter, structure, links, formatting, auto-fix, json]
 
 structure:
   title: from_filename
