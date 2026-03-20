@@ -3,7 +3,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "td", about = "Schema-driven markdown toolkit")]
+#[command(name = "td", about = "Schema-driven markdown toolkit", version)]
 pub struct Cli {
     /// Enable debug logging (schema loading, type resolution, per-file decisions)
     #[arg(long)]

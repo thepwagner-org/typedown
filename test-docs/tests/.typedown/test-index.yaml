@@ -3,7 +3,7 @@ description: >-
   and explains how the suite works. Exercises fixed title, managed content,
   intro_text, and link target_type validation.
 paths:
-  - "test-docs/INDEX.md"
+  - "INDEX.md"
 
 fields:
   edition:

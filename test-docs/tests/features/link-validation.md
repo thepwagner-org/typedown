@@ -40,3 +40,4 @@ also link back. Links to `#anchors` and `https://` URLs are skipped.
 
 - [Section Structure](./section-structure.md)
 - [Auto Fix](./auto-fix.md)
+- [Cross-Project Linking](./cross-project-linking.md)

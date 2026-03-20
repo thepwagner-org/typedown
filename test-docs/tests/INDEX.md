@@ -1,6 +1,6 @@
 ---
 edition: 1
-updated: 2026-03-03
+updated: 2026-03-18
 ---
 # Test Index
 
@@ -12,6 +12,7 @@ updated: 2026-03-03
 - [Auto Fix](./features/auto-fix.md)
 - [JSON Output](./features/json-output.md)
 - [Properties](./features/properties.md)
+- [Cross-Project Linking](./features/cross-project-linking.md)
 
 ## How This Works
 

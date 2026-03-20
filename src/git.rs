@@ -14,6 +14,14 @@ use std::{
 
 use git2::Repository;
 
+/// Return the absolute path of the git working directory containing `root`.
+///
+/// Returns `None` if `root` is not inside a git repository.
+pub fn git_repo_root(root: &Path) -> Option<PathBuf> {
+    let repo = Repository::discover(root).ok()?;
+    Some(repo.workdir()?.to_path_buf())
+}
+
 /// Build the set of all absolute paths tracked in HEAD.
 ///
 /// Returns `None` if `root` is not inside a git repository, or if HEAD has

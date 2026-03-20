@@ -3,7 +3,7 @@ description: >-
   by it. Each file exercises specific schema capabilities so a dumb agent
   breaking the file gets caught by the very feature it's editing.
 paths:
-  - "test-docs/features/*.md"
+  - "features/*.md"
 
 fields:
   status:
@@ -41,4 +41,7 @@ structure:
       links:
         target_type: test-feature
         bidirectional: true
+    - title: External Links
+      links:
+        target_type: test-hardware
     - title: Notes

@@ -3,7 +3,7 @@
 //! All filesystem I/O lives here. `validate.rs` and `fix.rs` are pure.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -17,10 +17,10 @@ use crate::{
     ast::Document,
     fix::apply_fixes,
     parse::{get_frontmatter_error, parse, serialize, serialize_with_field_order},
-    schema::{self, PathMatcher, Schema, SCHEMA_DIR},
+    schema::{self, PathMatcher, Schema, TypeDef, SCHEMA_DIR},
     validate::{
-        detect_malformed_links, validate, validate_unknown_type, Diagnostic, LinkedDocInfo,
-        ValidateCtx,
+        detect_malformed_links, resolve_link_path, validate, validate_unknown_type, Diagnostic,
+        LinkedDocInfo, ValidateCtx,
     },
 };
 
@@ -67,11 +67,30 @@ pub fn format_dir(root: &Path, opts: FormatOptions) -> Result<FormatResult> {
     // Pre-load linked-doc info for bidirectional link validation.
     // Key: absolute path → LinkedDocInfo.  Also returns a doc cache so
     // format_file can skip re-reading/re-parsing files it already has.
-    let (linked_docs, doc_cache) = preload_linked_docs(root, &schemas, &matchers);
+    let (mut linked_docs, doc_cache) = preload_linked_docs(root, &schemas, &matchers);
     debug!(linked_docs = linked_docs.len(), "preloaded linked docs");
 
     // Pre-load git-tracked paths for cross-project link validation.
     let git_tree = crate::git::list_git_paths(root);
+
+    // Discover and pre-load cross-project link targets for typed link validation.
+    // Uses the git repo root as the ceiling for external schema discovery.
+    let external_types = if let Some(repo_root) = crate::git::git_repo_root(root) {
+        let ext_targets = collect_external_targets(&linked_docs, root);
+        if ext_targets.is_empty() {
+            HashMap::new()
+        } else {
+            let (ext_linked, ext_types) = preload_external_link_targets(&ext_targets, &repo_root);
+            debug!(
+                external_docs = ext_linked.len(),
+                "preloaded external link targets"
+            );
+            linked_docs.extend(ext_linked);
+            ext_types
+        }
+    } else {
+        HashMap::new()
+    };
 
     // Collect all markdown paths (WalkDir is sequential by design).
     let paths: Vec<PathBuf> = WalkDir::new(root)
@@ -97,6 +116,7 @@ pub fn format_dir(root: &Path, opts: FormatOptions) -> Result<FormatResult> {
                 &linked_docs,
                 &doc_cache,
                 git_tree.as_ref(),
+                &external_types,
                 opts,
             )
             .map_err(|e| (path.clone(), e))
@@ -127,9 +147,26 @@ pub fn check_dir(root: &Path) -> Result<Vec<FileError>> {
     let mut result = FormatResult::default();
     let (schemas, matchers) = load_all_schemas(root, &mut result);
     debug!(schema_dirs = schemas.len(), "loaded schemas");
-    let (linked_docs, doc_cache) = preload_linked_docs(root, &schemas, &matchers);
+    let (mut linked_docs, doc_cache) = preload_linked_docs(root, &schemas, &matchers);
     debug!(linked_docs = linked_docs.len(), "preloaded linked docs");
     let git_tree = crate::git::list_git_paths(root);
+
+    let external_types = if let Some(repo_root) = crate::git::git_repo_root(root) {
+        let ext_targets = collect_external_targets(&linked_docs, root);
+        if ext_targets.is_empty() {
+            HashMap::new()
+        } else {
+            let (ext_linked, ext_types) = preload_external_link_targets(&ext_targets, &repo_root);
+            debug!(
+                external_docs = ext_linked.len(),
+                "preloaded external link targets"
+            );
+            linked_docs.extend(ext_linked);
+            ext_types
+        }
+    } else {
+        HashMap::new()
+    };
 
     let mut file_errors: Vec<FileError> = result.errors; // schema load errors
 
@@ -154,6 +191,7 @@ pub fn check_dir(root: &Path) -> Result<Vec<FileError>> {
                 &linked_docs,
                 &doc_cache,
                 git_tree.as_ref(),
+                &external_types,
             );
             if diagnostics.is_empty() {
                 None
@@ -183,6 +221,7 @@ fn format_file(
     linked_docs: &HashMap<PathBuf, LinkedDocInfo>,
     doc_cache: &HashMap<PathBuf, (String, Document)>,
     git_tree: Option<&std::collections::HashSet<PathBuf>>,
+    external_types: &HashMap<String, TypeDef>,
     opts: FormatOptions,
 ) -> Result<Option<bool>> {
     // Use the preloaded content+doc if available; otherwise read from disk.
@@ -232,6 +271,7 @@ fn format_file(
                 schema,
                 linked_docs,
                 git_tree,
+                external_types,
             };
             let mut diags = validate(&doc, type_def, &ctx, Some(file_size));
             // Path-matched files don't need `type:` in frontmatter -- suppress
@@ -333,6 +373,7 @@ fn format_file(
 }
 
 /// Check a single file and return any diagnostics (no writes).
+#[allow(clippy::too_many_arguments)]
 fn check_file(
     path: &Path,
     root: &Path,
@@ -341,6 +382,7 @@ fn check_file(
     linked_docs: &HashMap<PathBuf, LinkedDocInfo>,
     doc_cache: &HashMap<PathBuf, (String, Document)>,
     git_tree: Option<&std::collections::HashSet<PathBuf>>,
+    external_types: &HashMap<String, TypeDef>,
 ) -> Vec<Diagnostic> {
     // Fast path: reuse the preloaded (content, doc) — no disk I/O or re-parse.
     if let Some((content, doc)) = doc_cache.get(path) {
@@ -353,6 +395,7 @@ fn check_file(
             matchers,
             linked_docs,
             git_tree,
+            external_types,
         );
     }
     // Slow path: file wasn't preloaded (shouldn't happen for files under a schema).
@@ -372,6 +415,7 @@ fn check_file(
         matchers,
         linked_docs,
         git_tree,
+        external_types,
     )
 }
 
@@ -386,6 +430,7 @@ fn check_document(
     matchers: &HashMap<PathBuf, PathMatcher>,
     linked_docs: &HashMap<PathBuf, LinkedDocInfo>,
     git_tree: Option<&std::collections::HashSet<PathBuf>>,
+    external_types: &HashMap<String, TypeDef>,
 ) -> Vec<Diagnostic> {
     let rel = path.strip_prefix(root).unwrap_or(path);
     let file_size = content.len();
@@ -421,6 +466,7 @@ fn check_document(
                 schema,
                 linked_docs,
                 git_tree,
+                external_types,
             };
             let mut diags = validate(doc, type_def, &ctx, Some(file_size));
             if matches!(&resolved, ResolvedType::PathMatched(..)) {
@@ -632,35 +678,12 @@ fn preload_linked_docs(
             }
         };
 
-        // Collect links per H2 section
-        let mut section_links: HashMap<String, Vec<String>> = HashMap::new();
-        let h2s: Vec<(usize, String)> = doc
-            .blocks
-            .iter()
-            .enumerate()
-            .filter_map(|(i, b)| match b {
-                crate::ast::Block::Heading {
-                    level: 2, content, ..
-                } => Some((i, crate::ast::inlines_to_string(content))),
-                _ => None,
-            })
-            .collect();
-
-        for (hi, (start, title)) in h2s.iter().enumerate() {
-            let end = h2s.get(hi + 1).map(|(i, _)| *i).unwrap_or(doc.blocks.len());
-            let section_blocks = &doc.blocks[start + 1..end];
-            let links = extract_all_links(section_blocks);
-            if !links.is_empty() {
-                section_links.insert(title.clone(), links);
-            }
-        }
-
         linked.insert(
             abs.clone(),
             LinkedDocInfo {
                 path: path.to_path_buf(),
                 doc_type,
-                section_links,
+                section_links: extract_doc_section_links(&doc),
             },
         );
 
@@ -669,6 +692,207 @@ fn preload_linked_docs(
     }
 
     (linked, doc_cache)
+}
+
+// ── Cross-project schema discovery and external target preloading ─────────────
+
+/// Collect all relative link URLs from H2 sections in a document, keyed by
+/// section title.  Used by both local and external preloading.
+fn extract_doc_section_links(doc: &Document) -> HashMap<String, Vec<String>> {
+    let mut section_links: HashMap<String, Vec<String>> = HashMap::new();
+    let h2s: Vec<(usize, String)> = doc
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| match b {
+            crate::ast::Block::Heading {
+                level: 2, content, ..
+            } => Some((i, crate::ast::inlines_to_string(content))),
+            _ => None,
+        })
+        .collect();
+
+    for (hi, (start, title)) in h2s.iter().enumerate() {
+        let end = h2s.get(hi + 1).map(|(i, _)| *i).unwrap_or(doc.blocks.len());
+        let section_blocks = &doc.blocks[start + 1..end];
+        let links = extract_all_links(section_blocks);
+        if !links.is_empty() {
+            section_links.insert(title.clone(), links);
+        }
+    }
+
+    section_links
+}
+
+/// Walk up from `path` looking for a `.typedown/` directory, stopping at
+/// `ceiling` (typically the git repo root).  Returns the first found.
+///
+/// Unlike `find_schema_for`, this checks the filesystem directly (no
+/// pre-loaded map) and is used for cross-project schema discovery.
+fn find_external_schema_dir(path: &Path, ceiling: &Path) -> Option<PathBuf> {
+    let mut dir = path.parent()?;
+    loop {
+        let candidate = dir.join(SCHEMA_DIR);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if dir == ceiling {
+            break;
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
+/// Collect the set of unique external (cross-project) link targets that appear
+/// in any section of any preloaded document.
+///
+/// "External" means the resolved absolute path is outside `root`.  Only files
+/// that actually exist on disk are included; broken cross-project links are
+/// already caught by the `git_tree` check in `validate_all_links`.
+fn collect_external_targets(
+    linked_docs: &HashMap<PathBuf, LinkedDocInfo>,
+    root: &Path,
+) -> HashSet<PathBuf> {
+    let mut targets = HashSet::new();
+    for (source_path, info) in linked_docs {
+        for urls in info.section_links.values() {
+            for url in urls {
+                let Some(target) = resolve_link_path(url, source_path) else {
+                    continue;
+                };
+                if target.starts_with(root) {
+                    continue; // internal — already in linked_docs
+                }
+                if target.exists() {
+                    targets.insert(target);
+                }
+            }
+        }
+    }
+    targets
+}
+
+/// Pre-load type and section-link information for cross-project link targets.
+///
+/// For each unique external target file:
+/// 1. Walk up from the target to find its `.typedown/` directory (stopping at
+///    `ceiling`, the git repo root).
+/// 2. Load that schema (cached by schema dir — typically just one load per
+///    sibling project).
+/// 3. Read + parse the target file and resolve its doc type via frontmatter or
+///    path-pattern matching against the external schema.
+/// 4. Extract H2 section links for bidirectional validation.
+///
+/// File reads in step 3 are parallelised with rayon.
+///
+/// Returns:
+/// - A map of `abs_path → LinkedDocInfo` to merge into the main `linked_docs`.
+/// - A flat map of `type_name → TypeDef` from all discovered external schemas,
+///   used to resolve target type definitions during bidi validation.
+fn preload_external_link_targets(
+    targets: &HashSet<PathBuf>,
+    ceiling: &Path,
+) -> (HashMap<PathBuf, LinkedDocInfo>, HashMap<String, TypeDef>) {
+    if targets.is_empty() {
+        return (HashMap::new(), HashMap::new());
+    }
+
+    // Phase 1 (sequential): discover schema dirs and load schemas.
+    // Typically hits just one or two sibling projects, so this is cheap.
+    let mut schema_cache: HashMap<PathBuf, (Schema, Option<PathMatcher>)> = HashMap::new();
+    let mut target_schema_dir: HashMap<PathBuf, PathBuf> = HashMap::new();
+
+    for target in targets {
+        let Some(schema_dir) = find_external_schema_dir(target, ceiling) else {
+            continue;
+        };
+        target_schema_dir.insert(target.clone(), schema_dir.clone());
+
+        if let std::collections::hash_map::Entry::Vacant(e) = schema_cache.entry(schema_dir) {
+            let schema_dir_ref = e.key();
+            match Schema::load(schema_dir_ref) {
+                Ok(schema) => {
+                    let matcher = schema.build_path_matcher().ok();
+                    debug!(
+                        dir = %schema_dir_ref.display(),
+                        types = schema.types.len(),
+                        "loaded external schema"
+                    );
+                    e.insert((schema, matcher));
+                }
+                Err(err) => {
+                    debug!(dir = %schema_dir_ref.display(), err = %err, "failed to load external schema");
+                }
+            }
+        }
+    }
+
+    // Phase 2: build flat type map from all external schemas.
+    let mut external_types: HashMap<String, TypeDef> = HashMap::new();
+    for (schema, _) in schema_cache.values() {
+        for (name, type_def) in &schema.types {
+            external_types
+                .entry(name.clone())
+                .or_insert_with(|| type_def.clone());
+        }
+    }
+
+    // Phase 3 (parallel): read + parse each target file, resolve type,
+    // extract section links.  schema_cache is read-only here.
+    let work: Vec<(PathBuf, Option<PathBuf>)> = targets
+        .iter()
+        .map(|t| (t.clone(), target_schema_dir.get(t).cloned()))
+        .collect();
+
+    let entries: Vec<(PathBuf, LinkedDocInfo)> = work
+        .par_iter()
+        .filter_map(|(target, schema_dir_opt)| {
+            let content = std::fs::read_to_string(target).ok()?;
+            let doc = parse(&content);
+
+            // Resolve type: frontmatter first, then path-pattern fallback.
+            let doc_type =
+                if let Some(t) = doc.frontmatter.as_ref().and_then(|fm| fm.doc_type.clone()) {
+                    // "type: none" opts out of validation — treat as untyped.
+                    if t == "none" {
+                        None
+                    } else {
+                        Some(t)
+                    }
+                } else if let Some(schema_dir) = schema_dir_opt {
+                    schema_cache
+                        .get(schema_dir)
+                        .and_then(|(_, matcher_opt)| matcher_opt.as_ref())
+                        .and_then(|matcher| {
+                            let schema_root = schema_dir.parent().unwrap_or_else(|| Path::new(""));
+                            target.strip_prefix(schema_root).ok().and_then(|rel| {
+                                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                                let matched = matcher.match_path(&rel_str);
+                                if matched.len() == 1 {
+                                    Some(matched[0].to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                } else {
+                    None
+                };
+
+            Some((
+                target.clone(),
+                LinkedDocInfo {
+                    path: target.clone(),
+                    doc_type,
+                    section_links: extract_doc_section_links(&doc),
+                },
+            ))
+        })
+        .collect();
+
+    let linked_map = entries.into_iter().collect();
+    (linked_map, external_types)
 }
 
 // ── Link extraction ───────────────────────────────────────────────────────────
@@ -1450,6 +1674,205 @@ mod tests {
         assert!(
             !errors.is_empty(),
             "presets should apply without a .typedown/ dir"
+        );
+    }
+
+    // ── Cross-project typed link validation ───────────────────────────────────
+
+    /// Create two sibling project directories inside a temp parent, initialise
+    /// a git repo at the parent (so `git_repo_root` has a ceiling to return),
+    /// and return `(parent_tempdir, proj_a_path, proj_b_path)`.
+    fn make_cross_project_tree(
+        files_a: &[(&str, &str)],
+        files_b: &[(&str, &str)],
+    ) -> (TempDir, PathBuf, PathBuf) {
+        let parent = TempDir::new().unwrap();
+        let proj_a = parent.path().join("proj-a");
+        let proj_b = parent.path().join("proj-b");
+
+        for (rel, content) in files_a {
+            let full = proj_a.join(rel);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(&full, content).unwrap();
+        }
+        for (rel, content) in files_b {
+            let full = proj_b.join(rel);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(&full, content).unwrap();
+        }
+
+        // Git repo at parent — gives check_dir a real ceiling for schema walks.
+        git2::Repository::init(parent.path()).unwrap();
+
+        (parent, proj_a, proj_b)
+    }
+
+    /// Schema YAML: interest type with a Movies section requiring `target_type: movie`.
+    const INTEREST_YAML: &str =
+        "structure:\n  sections:\n    - title: Movies\n      links:\n        target_type: movie\n";
+
+    /// Schema YAML: minimal movie type (no required fields).
+    const MOVIE_YAML: &str = "description: A movie\n";
+
+    #[test]
+    fn test_cross_project_link_correct_type_no_error() {
+        // interest.md in proj-a links to a movie in proj-b;
+        // proj-b has .typedown/movie.yaml — td should discover it and not fire.
+        let (_parent, proj_a, _proj_b) = make_cross_project_tree(
+            &[
+                (".typedown/interest.yaml", INTEREST_YAML),
+                (
+                    "interest.md",
+                    "---\ntype: interest\n---\n# Test Interest\n\n## Movies\n\n- [Some Movie](../proj-b/movies/some-movie.md)\n",
+                ),
+            ],
+            &[
+                (".typedown/movie.yaml", MOVIE_YAML),
+                ("movies/some-movie.md", "---\ntype: movie\n---\n# Some Movie\n"),
+            ],
+        );
+
+        let errors = check_dir(&proj_a).unwrap();
+        let type_mismatches: Vec<_> = errors
+            .iter()
+            .flat_map(|e| e.diagnostics.iter())
+            .filter(|d| matches!(d, Diagnostic::LinkTargetTypeMismatch { .. }))
+            .collect();
+        assert!(
+            type_mismatches.is_empty(),
+            "expected no LinkTargetTypeMismatch for correctly-typed cross-project link, got: {type_mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn test_cross_project_link_wrong_type_reports_error() {
+        // interest.md expects target_type: movie but links to a tvshow.
+        let (_parent, proj_a, _proj_b) = make_cross_project_tree(
+            &[
+                (".typedown/interest.yaml", INTEREST_YAML),
+                (
+                    "interest.md",
+                    "---\ntype: interest\n---\n# Test Interest\n\n## Movies\n\n- [Some Show](../proj-b/tvshows/some-show.md)\n",
+                ),
+            ],
+            &[
+                (".typedown/tvshow.yaml", "description: A TV show\n"),
+                (
+                    "tvshows/some-show.md",
+                    "---\ntype: tvshow\n---\n# Some Show\n",
+                ),
+            ],
+        );
+
+        let errors = check_dir(&proj_a).unwrap();
+        let has_mismatch = errors.iter().flat_map(|e| e.diagnostics.iter()).any(|d| {
+            matches!(d, Diagnostic::LinkTargetTypeMismatch { expected, actual: Some(actual), .. }
+                    if expected == "movie" && actual == "tvshow")
+        });
+        assert!(
+            has_mismatch,
+            "expected LinkTargetTypeMismatch(expected=movie, actual=tvshow), got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_cross_project_link_untyped_target_reports_error() {
+        // Target file has no `type:` frontmatter and proj-b has no .typedown/;
+        // td cannot determine the type → LinkTargetTypeMismatch with actual: None.
+        let (_parent, proj_a, _proj_b) = make_cross_project_tree(
+            &[
+                (".typedown/interest.yaml", INTEREST_YAML),
+                (
+                    "interest.md",
+                    "---\ntype: interest\n---\n# Test Interest\n\n## Movies\n\n- [Some Movie](../proj-b/movies/some-movie.md)\n",
+                ),
+            ],
+            &[
+                // No .typedown/ in proj-b, no type: in target frontmatter
+                ("movies/some-movie.md", "# Some Movie\n"),
+            ],
+        );
+
+        let errors = check_dir(&proj_a).unwrap();
+        let has_mismatch = errors
+            .iter()
+            .flat_map(|e| e.diagnostics.iter())
+            .any(|d| matches!(d, Diagnostic::LinkTargetTypeMismatch { actual: None, .. }));
+        assert!(
+            has_mismatch,
+            "expected LinkTargetTypeMismatch(actual:None) for untyped cross-project target, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_cross_project_bidi_backlink_present_no_error() {
+        // interest.md (proj-a) links to personality (proj-b) with bidirectional: true.
+        // personality.md has a backlink in "Related Interests" section.
+        let interest_yaml = "structure:\n  sections:\n    - title: Personalities\n      links:\n        target_type: personality\n        bidirectional: true\n";
+        let personality_yaml = "structure:\n  sections:\n    - title: Related Interests\n      links:\n        target_type: interest\n";
+
+        let (_parent, proj_a, _proj_b) = make_cross_project_tree(
+            &[
+                (".typedown/interest.yaml", interest_yaml),
+                (
+                    "interest.md",
+                    "---\ntype: interest\n---\n# Test Interest\n\n## Personalities\n\n- [Alice](../proj-b/personalities/alice.md)\n",
+                ),
+            ],
+            &[
+                (".typedown/personality.yaml", personality_yaml),
+                (
+                    "personalities/alice.md",
+                    // two levels up: personalities/ → proj-b/ → parent/ → proj-a/
+                    "---\ntype: personality\n---\n# Alice\n\n## Related Interests\n\n- [Test Interest](../../proj-a/interest.md)\n",
+                ),
+            ],
+        );
+
+        let errors = check_dir(&proj_a).unwrap();
+        let backlink_errors: Vec<_> = errors
+            .iter()
+            .flat_map(|e| e.diagnostics.iter())
+            .filter(|d| matches!(d, Diagnostic::MissingBacklink { .. }))
+            .collect();
+        assert!(
+            backlink_errors.is_empty(),
+            "expected no MissingBacklink when cross-project backlink is present, got: {backlink_errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_cross_project_bidi_backlink_missing_reports_error() {
+        // Same setup but personality.md has no backlink → MissingBacklink.
+        let interest_yaml = "structure:\n  sections:\n    - title: Personalities\n      links:\n        target_type: personality\n        bidirectional: true\n";
+        let personality_yaml = "structure:\n  sections:\n    - title: Related Interests\n      links:\n        target_type: interest\n";
+
+        let (_parent, proj_a, _proj_b) = make_cross_project_tree(
+            &[
+                (".typedown/interest.yaml", interest_yaml),
+                (
+                    "interest.md",
+                    "---\ntype: interest\n---\n# Test Interest\n\n## Personalities\n\n- [Alice](../proj-b/personalities/alice.md)\n",
+                ),
+            ],
+            &[
+                (".typedown/personality.yaml", personality_yaml),
+                (
+                    "personalities/alice.md",
+                    // Related Interests section exists but has no link back
+                    "---\ntype: personality\n---\n# Alice\n\n## Related Interests\n\n- placeholder\n",
+                ),
+            ],
+        );
+
+        let errors = check_dir(&proj_a).unwrap();
+        let has_missing_backlink = errors
+            .iter()
+            .flat_map(|e| e.diagnostics.iter())
+            .any(|d| matches!(d, Diagnostic::MissingBacklink { .. }));
+        assert!(
+            has_missing_backlink,
+            "expected MissingBacklink when cross-project backlink is absent, got: {errors:?}"
         );
     }
 }

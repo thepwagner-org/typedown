@@ -3,7 +3,7 @@ description: >-
   first (chronological). Exercises from_date title mode, date_headings with
   oldest_first sort.
 paths:
-  - "test-docs/log/*.md"
+  - "log/*.md"
 
 structure:
   title: from_date

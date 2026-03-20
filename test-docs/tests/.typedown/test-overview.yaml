@@ -1,9 +1,9 @@
 description: >-
-  The test-docs overview page. Exercises from_directory title mode, the
-  structure-level intro section (content between H1 and the first H2),
-  and link target_type without bidirectional.
+  The test-docs overview page. Exercises from_directory title mode (the parent
+  directory is named "tests"), the structure-level intro section (content
+  between H1 and the first H2), and link target_type without bidirectional.
 paths:
-  - "test-docs/OVERVIEW.md"
+  - "OVERVIEW.md"
 
 fields:
   maintained_by:

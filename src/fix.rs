@@ -5,7 +5,7 @@
 
 use crate::{
     ast::{Block, Document, Inline, ListItem},
-    validate::Diagnostic,
+    validate::{Diagnostic, SortedEntry},
 };
 
 // ── Fix ───────────────────────────────────────────────────────────────────────
@@ -38,7 +38,7 @@ pub enum Fix {
     /// Rebuild the document with date entries in the correct sort order.
     SortEntries {
         preamble: Vec<Block>,
-        sorted_entries: Vec<(String, Option<String>, Vec<Block>)>,
+        sorted_entries: Vec<SortedEntry>,
     },
     /// Remove empty optional sections.
     ///
@@ -222,7 +222,7 @@ impl Fix {
                 sorted_entries,
             } => {
                 doc.blocks = preamble.clone();
-                for (_, _, entry_blocks) in sorted_entries {
+                for (_, _, _, entry_blocks) in sorted_entries {
                     doc.blocks.extend(entry_blocks.clone());
                 }
             }

@@ -19,6 +19,11 @@ use crate::{
     },
 };
 
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+/// A date-heading entry ready for sorting or fixing: `(date, time, suffix, blocks)`.
+pub type SortedEntry = (String, Option<String>, Option<String>, Vec<Block>);
+
 // ── Diagnostic ───────────────────────────────────────────────────────────────
 
 /// A validation problem found in a document.
@@ -121,8 +126,8 @@ pub enum Diagnostic {
     EntriesOutOfOrder {
         /// Preamble blocks before the first date heading.
         preamble: Vec<Block>,
-        /// Entries sorted into correct order: `(date_str, time_str_opt, blocks)`.
-        sorted_entries: Vec<(String, Option<String>, Vec<Block>)>,
+        /// Entries sorted into correct order: `(date_str, time_str_opt, suffix_opt, blocks)`.
+        sorted_entries: Vec<SortedEntry>,
     },
     /// A link-like pattern has an unencoded space in the URL, making it unparseable.
     ///
@@ -219,7 +224,7 @@ impl Diagnostic {
             }
             Self::UnknownType { message, .. } => message.clone(),
             Self::InvalidDateHeading { text, .. } => {
-                format!("'{text}' is not a valid date heading (expected YYYY-MM-DD or YYYY-MM-DD HH:MM)")
+                format!("'{text}' is not a valid date heading (expected YYYY-MM-DD or YYYY-MM-DD HH:MM, optionally followed by ' - title')")
             }
             Self::DateHeadingFileMismatch {
                 heading,
@@ -298,6 +303,9 @@ pub struct ValidateCtx<'a> {
     pub linked_docs: &'a HashMap<PathBuf, LinkedDocInfo>,
     /// Pre-loaded set of all git-tracked absolute paths (for cross-project links).
     pub git_tree: Option<&'a std::collections::HashSet<PathBuf>>,
+    /// Type definitions discovered from external (cross-project) schemas.
+    /// Used as a fallback for bidi validation when the target type isn't in `schema`.
+    pub external_types: &'a HashMap<String, TypeDef>,
 }
 
 // ── Malformed link scanning ───────────────────────────────────────────────────
@@ -799,10 +807,16 @@ pub fn month_title_from_path(path: &Path) -> Option<String> {
 
 // ── Date heading validation ───────────────────────────────────────────────────
 
-/// Parse an H2 text as a journal date entry: `YYYY-MM-DD` or `YYYY-MM-DD HH:MM`.
+/// Parse an H2 text as a journal date entry.
 ///
-/// Returns `(date_str, time_str_or_none)` on success, `None` on failure.
-fn parse_entry_heading(text: &str) -> Option<(String, Option<String>)> {
+/// Accepted forms:
+/// - `YYYY-MM-DD`
+/// - `YYYY-MM-DD HH:MM`
+/// - `YYYY-MM-DD - title`
+/// - `YYYY-MM-DD HH:MM - title`
+///
+/// Returns `(date_str, time_str_or_none, suffix_or_none)` on success, `None` on failure.
+fn parse_entry_heading(text: &str) -> Option<(String, Option<String>, Option<String>)> {
     // Must start with YYYY-MM-DD
     if text.len() < 10 {
         return None;
@@ -818,24 +832,46 @@ fn parse_entry_heading(text: &str) -> Option<(String, Option<String>)> {
     {
         return None;
     }
-    // Optionally followed by " HH:MM"
-    let time_part = if rest.is_empty() {
-        None
-    } else if rest.starts_with(' ') && rest.len() == 6 {
-        let t = &rest[1..]; // "HH:MM"
+
+    // rest is everything after YYYY-MM-DD.  Four valid patterns:
+    //   ""              → date only
+    //   " - <suffix>"   → date + suffix
+    //   " HH:MM"        → date + time
+    //   " HH:MM - <s>"  → date + time + suffix
+    if rest.is_empty() {
+        return Some((date_part.to_string(), None, None));
+    }
+
+    // Try to parse a time component (" HH:MM")
+    if rest.starts_with(' ') && rest.len() >= 6 {
+        let t = &rest[1..6]; // potential "HH:MM"
         let tb = t.as_bytes();
         if tb[0..2].iter().all(|c| c.is_ascii_digit())
             && tb[2] == b':'
             && tb[3..5].iter().all(|c| c.is_ascii_digit())
         {
-            Some(t.to_string())
-        } else {
-            return None;
+            let after_time = &rest[6..]; // "" or " - <suffix>"
+            let suffix = parse_suffix(after_time)?;
+            return Some((date_part.to_string(), Some(t.to_string()), suffix));
         }
+    }
+
+    // No time — try suffix directly (" - <suffix>")
+    let suffix = parse_suffix(rest)?;
+    Some((date_part.to_string(), None, suffix))
+}
+
+/// Parse the optional ` - <suffix>` tail that follows a date or time component.
+///
+/// - Empty string → `Some(None)` (no suffix, still valid)
+/// - `" - <text>"` → `Some(Some(text))` (suffix present)
+/// - Anything else → `None` (invalid trailing text)
+fn parse_suffix(s: &str) -> Option<Option<String>> {
+    if s.is_empty() {
+        Some(None)
     } else {
-        return None;
-    };
-    Some((date_part.to_string(), time_part))
+        s.strip_prefix(" - ").map(|suffix| Some(suffix.to_string()))
+    }
 }
 
 /// Sort key for an entry: `(date, time)` where missing time sorts last (end of day).
@@ -865,7 +901,7 @@ fn validate_date_headings(
         .collect();
 
     // Validate each H2 as a date, and check file-period match
-    let mut valid_entries: Vec<(String, Option<String>, usize)> = Vec::new(); // (date, time, block_idx)
+    let mut valid_entries: Vec<(String, Option<String>, Option<String>, usize)> = Vec::new(); // (date, time, suffix, block_idx)
     for (block_idx, text, line) in &h2s {
         match parse_entry_heading(text) {
             None => {
@@ -874,7 +910,7 @@ fn validate_date_headings(
                     text: text.clone(),
                 });
             }
-            Some((date, time)) => {
+            Some((date, time, suffix)) => {
                 // Check YYYY-MM prefix matches file period
                 if let Some(period) = file_period {
                     let entry_period = &date[..7]; // "YYYY-MM"
@@ -886,7 +922,7 @@ fn validate_date_headings(
                         });
                     }
                 }
-                valid_entries.push((date, time, *block_idx));
+                valid_entries.push((date, time, suffix, *block_idx));
             }
         }
     }
@@ -897,7 +933,7 @@ fn validate_date_headings(
     }
     let keys: Vec<(String, String)> = valid_entries
         .iter()
-        .map(|(d, t, _)| entry_sort_key(d, t.as_deref()))
+        .map(|(d, t, _, _)| entry_sort_key(d, t.as_deref()))
         .collect();
 
     let in_order = match def.sort {
@@ -913,22 +949,22 @@ fn validate_date_headings(
         };
 
         // Slice each entry: from its H2 block to the next H2 (or end of doc)
-        let mut entries_with_blocks: Vec<(String, Option<String>, Vec<Block>)> = valid_entries
+        let mut entries_with_blocks: Vec<SortedEntry> = valid_entries
             .iter()
             .enumerate()
-            .map(|(ei, (date, time, start_idx))| {
+            .map(|(ei, (date, time, suffix, start_idx))| {
                 // Find the next H2 block index
                 let next_h2_idx = valid_entries
                     .get(ei + 1)
-                    .map(|(_, _, idx)| *idx)
+                    .map(|(_, _, _, idx)| *idx)
                     .unwrap_or(doc.blocks.len());
                 let entry_blocks = doc.blocks[*start_idx..next_h2_idx].to_vec();
-                (date.clone(), time.clone(), entry_blocks)
+                (date.clone(), time.clone(), suffix.clone(), entry_blocks)
             })
             .collect();
 
         // Sort
-        entries_with_blocks.sort_by(|(da, ta, _), (db, tb, _)| {
+        entries_with_blocks.sort_by(|(da, ta, _, _), (db, tb, _, _)| {
             let ka = entry_sort_key(da, ta.as_deref());
             let kb = entry_sort_key(db, tb.as_deref());
             match def.sort {
@@ -1802,7 +1838,11 @@ fn validate_bidirectional_link(
     ctx: &ValidateCtx<'_>,
     out: &mut Vec<Diagnostic>,
 ) {
-    let Some(target_type_def) = ctx.schema.get_type(target_type) else {
+    let Some(target_type_def) = ctx
+        .schema
+        .get_type(target_type)
+        .or_else(|| ctx.external_types.get(target_type))
+    else {
         out.push(Diagnostic::UnknownType {
             line: heading_line,
             message: format!(
@@ -1939,6 +1979,11 @@ mod tests {
         EMPTY.get_or_init(HashMap::new)
     }
 
+    fn empty_external_types() -> &'static HashMap<String, TypeDef> {
+        static EMPTY: OnceLock<HashMap<String, TypeDef>> = OnceLock::new();
+        EMPTY.get_or_init(HashMap::new)
+    }
+
     /// Convenience: build a ValidateCtx for tests (no git tree, empty linked_docs by default).
     fn make_ctx<'a>(
         source_type: &'a str,
@@ -1952,6 +1997,7 @@ mod tests {
             schema,
             linked_docs,
             git_tree: None,
+            external_types: empty_external_types(),
         }
     }
 
@@ -2703,6 +2749,83 @@ structure:
         assert!(order_diags.is_empty(), "got: {diags:?}");
     }
 
+    #[test]
+    fn test_date_headings_with_suffix() {
+        let yaml = "structure:\n  title: from_date\n  date_headings:\n    sort: newest_first\n";
+        let (schema, type_def) = make_schema("journal", yaml);
+        // Date-only headings with a suffix label
+        let doc = parse(
+            "---\ntype: journal\n---\n# February 2026\n\n## 2026-02-23 - standup\n\n- Notes.\n\n## 2026-02-22 - retro\n\n- More notes.\n",
+        );
+        let path = Path::new("2026-02.md");
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("journal", path, &schema, empty_linked_docs()),
+            None,
+        );
+        let date_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Diagnostic::InvalidDateHeading { .. } | Diagnostic::EntriesOutOfOrder { .. }
+                )
+            })
+            .collect();
+        assert!(date_diags.is_empty(), "got: {diags:?}");
+    }
+
+    #[test]
+    fn test_date_headings_with_time_and_suffix() {
+        let yaml = "structure:\n  title: from_date\n  date_headings:\n    sort: newest_first\n";
+        let (schema, type_def) = make_schema("journal", yaml);
+        // Date + time headings with a suffix label; sort order should still work
+        let doc = parse(
+            "---\ntype: journal\n---\n# February 2026\n\n## 2026-02-23 21:14 - evening\n\n- Later.\n\n## 2026-02-23 09:00 - morning standup\n\n- Earlier.\n",
+        );
+        let path = Path::new("2026-02.md");
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("journal", path, &schema, empty_linked_docs()),
+            None,
+        );
+        let date_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Diagnostic::InvalidDateHeading { .. } | Diagnostic::EntriesOutOfOrder { .. }
+                )
+            })
+            .collect();
+        assert!(date_diags.is_empty(), "got: {diags:?}");
+    }
+
+    #[test]
+    fn test_date_headings_invalid_suffix_no_separator() {
+        // A suffix without the " - " separator must be rejected
+        let yaml = "structure:\n  title: from_date\n  date_headings:\n    sort: newest_first\n";
+        let (schema, type_def) = make_schema("journal", yaml);
+        let doc = parse(
+            "---\ntype: journal\n---\n# February 2026\n\n## 2026-02-23 morning\n\n- Notes.\n",
+        );
+        let path = Path::new("2026-02.md");
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("journal", path, &schema, empty_linked_docs()),
+            None,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| matches!(d, Diagnostic::InvalidDateHeading { .. })),
+            "expected InvalidDateHeading, got: {diags:?}"
+        );
+    }
+
     // ── detect_malformed_links ────────────────────────────────────────────────
 
     #[test]
@@ -3090,6 +3213,7 @@ structure:
             schema: &schema,
             linked_docs: &linked_docs,
             git_tree: None,
+            external_types: empty_external_types(),
         };
         let diags = validate(&doc, &project_def, &ctx, None);
         assert!(
@@ -3133,6 +3257,7 @@ structure:
             schema: &schema,
             linked_docs: &linked_docs,
             git_tree: None,
+            external_types: empty_external_types(),
         };
         let diags = validate(&doc, &project_def, &ctx, None);
         assert!(
@@ -3172,6 +3297,7 @@ structure:
             schema: &schema,
             linked_docs: &linked_docs,
             git_tree: None,
+            external_types: empty_external_types(),
         };
         let diags = validate(&doc, &project_def, &ctx, None);
         // Should not panic; should emit some diagnostic
@@ -3216,6 +3342,7 @@ structure:
             schema: &schema,
             linked_docs: &linked_docs,
             git_tree: None,
+            external_types: empty_external_types(),
         };
         let diags = validate(&doc, &threat_def, &ctx, None);
         assert!(

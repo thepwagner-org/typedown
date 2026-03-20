@@ -6,7 +6,7 @@ description: >-
   case-insensitive key matching, required vs optional properties, and
   integer/enum coercion in td json output.
 paths:
-  - "test-docs/hardware/*.md"
+  - "*.md"
 
 structure:
   title: from_filename
