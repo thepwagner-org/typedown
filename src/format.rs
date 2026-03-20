@@ -80,7 +80,9 @@ pub fn format_dir(root: &Path, opts: FormatOptions) -> Result<FormatResult> {
         if ext_targets.is_empty() {
             HashMap::new()
         } else {
-            let (ext_linked, ext_types) = preload_external_link_targets(&ext_targets, &repo_root);
+            let presets = schema::load_presets();
+            let (ext_linked, ext_types) =
+                preload_external_link_targets(&ext_targets, &repo_root, presets.as_ref());
             debug!(
                 external_docs = ext_linked.len(),
                 "preloaded external link targets"
@@ -156,7 +158,9 @@ pub fn check_dir(root: &Path) -> Result<Vec<FileError>> {
         if ext_targets.is_empty() {
             HashMap::new()
         } else {
-            let (ext_linked, ext_types) = preload_external_link_targets(&ext_targets, &repo_root);
+            let presets = schema::load_presets();
+            let (ext_linked, ext_types) =
+                preload_external_link_targets(&ext_targets, &repo_root, presets.as_ref());
             debug!(
                 external_docs = ext_linked.len(),
                 "preloaded external link targets"
@@ -793,6 +797,7 @@ fn collect_external_targets(
 fn preload_external_link_targets(
     targets: &HashSet<PathBuf>,
     ceiling: &Path,
+    presets: Option<&Schema>,
 ) -> (HashMap<PathBuf, LinkedDocInfo>, HashMap<String, TypeDef>) {
     if targets.is_empty() {
         return (HashMap::new(), HashMap::new());
@@ -812,7 +817,16 @@ fn preload_external_link_targets(
         if let std::collections::hash_map::Entry::Vacant(e) = schema_cache.entry(schema_dir) {
             let schema_dir_ref = e.key();
             match Schema::load(schema_dir_ref) {
-                Ok(schema) => {
+                Ok(mut schema) => {
+                    // Merge presets: fill in types not defined locally.
+                    if let Some(presets) = presets {
+                        for (name, type_def) in &presets.types {
+                            if !schema.types.contains_key(name) {
+                                debug!(name, "merged preset type into external schema");
+                                schema.types.insert(name.clone(), type_def.clone());
+                            }
+                        }
+                    }
                     let matcher = schema.build_path_matcher().ok();
                     debug!(
                         dir = %schema_dir_ref.display(),
@@ -1372,6 +1386,47 @@ mod tests {
         ]);
     }
 
+    #[test]
+    fn test_fix_section_reorder_idempotent() {
+        assert_idempotent(&[
+            (
+                ".typedown/doc.yaml",
+                "structure:\n  sections:\n    - title: Alpha\n    - title: Beta\n    - title: Gamma\n",
+            ),
+            (
+                "doc.md",
+                "---\ntype: doc\n---\n# Doc\n\n## Gamma\n\nG content.\n\n## Alpha\n\nA content.\n\n## Beta\n\nB content.\n",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn test_fix_section_reorder_preserves_content() {
+        let dir = make_tree(&[
+            (
+                ".typedown/doc.yaml",
+                "structure:\n  sections:\n    - title: Alpha\n    - title: Beta\n",
+            ),
+            (
+                "doc.md",
+                "---\ntype: doc\n---\n# Doc\n\n## Beta\n\nBeta content.\n\n## Alpha\n\nAlpha content.\n",
+            ),
+        ]);
+
+        format_dir(dir.path(), FormatOptions::default()).unwrap();
+
+        let result = fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        let alpha_pos = result.find("## Alpha").expect("Alpha present");
+        let beta_pos = result.find("## Beta").expect("Beta present");
+        assert!(alpha_pos < beta_pos, "Alpha should come before Beta: {result}");
+        assert!(result.contains("Alpha content."), "Alpha content preserved: {result}");
+        assert!(result.contains("Beta content."), "Beta content preserved: {result}");
+
+        // Second pass should be clean
+        let errors = check_dir(dir.path()).unwrap();
+        assert!(errors.is_empty(), "should be clean after fmt: {errors:?}");
+    }
+
     // ── Path-based type matching ──────────────────────────────────────────────
 
     #[test]
@@ -1875,4 +1930,51 @@ mod tests {
             "expected MissingBacklink when cross-project backlink is absent, got: {errors:?}"
         );
     }
+
+    #[test]
+    fn test_cross_project_preset_type_merged_into_external_schema() {
+        // proj-a has interest.yaml requiring target_type: movie in Movies section.
+        // proj-b has .typedown/ with a different type — the "movie" type comes
+        // from an XDG preset that gets merged into proj-b's schema.
+        let xdg_dir = TempDir::new().unwrap();
+        let presets = xdg_dir.path().join("typedown/presets");
+        fs::create_dir_all(&presets).unwrap();
+        fs::write(
+            presets.join("movie.yaml"),
+            "description: A movie\npaths:\n  - \"movies/*.md\"\n",
+        )
+        .unwrap();
+
+        let (_parent, proj_a, _proj_b) = make_cross_project_tree(
+            &[
+                (".typedown/interest.yaml", INTEREST_YAML),
+                (
+                    "interest.md",
+                    "---\ntype: interest\n---\n# Test Interest\n\n## Movies\n\n- [Some Movie](../proj-b/movies/some-movie.md)\n",
+                ),
+            ],
+            &[
+                // proj-b has .typedown/ but no movie type — it comes from preset
+                (".typedown/other.yaml", "description: Other type\n"),
+                ("movies/some-movie.md", "# Some Movie\n"),
+            ],
+        );
+
+        let _guard = XDG_LOCK.lock().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+        let errors = check_dir(&proj_a).unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        drop(_guard);
+
+        let type_mismatches: Vec<_> = errors
+            .iter()
+            .flat_map(|e| e.diagnostics.iter())
+            .filter(|d| matches!(d, Diagnostic::LinkTargetTypeMismatch { .. }))
+            .collect();
+        assert!(
+            type_mismatches.is_empty(),
+            "preset movie type should resolve for cross-project target, got: {type_mismatches:?}"
+        );
+    }
+
 }

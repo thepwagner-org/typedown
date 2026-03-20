@@ -61,8 +61,15 @@ pub enum Diagnostic {
         section: String,
         allowed: Vec<String>,
     },
-    /// A section appears out of order.
+    /// A section appears out of order (individual — for display only).
     SectionOutOfOrder { line: usize, section: String },
+    /// Sections are out of order and can be reordered (fixable).
+    SectionsOutOfOrder {
+        /// Blocks before the first H2 (frontmatter, H1, intro).
+        preamble: Vec<Block>,
+        /// Sections reordered into schema-defined order, each as its blocks.
+        sorted_sections: Vec<Vec<Block>>,
+    },
     /// A section contains non-bullet content where only bullets are expected.
     SectionNotBullets { line: usize, context: String },
     /// A list in a section has the wrong type (ordered vs unordered).
@@ -180,6 +187,9 @@ impl Diagnostic {
             Self::SectionOutOfOrder { section, .. } => {
                 format!("section '{section}' appears out of order")
             }
+            Self::SectionsOutOfOrder { .. } => {
+                "sections are out of order".to_string()
+            }
             Self::SectionNotBullets { context, .. } => {
                 format!("{context}: only bullet lists are allowed here")
             }
@@ -268,7 +278,9 @@ impl Diagnostic {
             | Self::UnknownType { line, .. }
             | Self::InvalidDateHeading { line, .. }
             | Self::DateHeadingFileMismatch { line, .. } => Some(*line),
-            Self::ManagedSectionNeedsUpdate { .. } | Self::EntriesOutOfOrder { .. } => None,
+            Self::ManagedSectionNeedsUpdate { .. }
+            | Self::EntriesOutOfOrder { .. }
+            | Self::SectionsOutOfOrder { .. } => None,
             Self::MalformedLink { line, .. } => Some(*line),
             Self::EmptyOptionalSection { .. } => None,
         }
@@ -1079,10 +1091,12 @@ fn validate_sections(
         }
 
         // Ordering: each recognised section's schema index must be non-decreasing
+        let mut has_order_error = false;
         let mut last_schema_idx = 0usize;
         for (_, h2, line) in &h2s {
             if let Some(idx) = allowed_titles.iter().position(|s| *s == h2.as_str()) {
                 if idx < last_schema_idx {
+                    has_order_error = true;
                     out.push(Diagnostic::SectionOutOfOrder {
                         line: *line,
                         section: h2.clone(),
@@ -1090,6 +1104,34 @@ fn validate_sections(
                 }
                 last_schema_idx = idx;
             }
+        }
+
+        // Emit a fixable SectionsOutOfOrder with sorted blocks
+        if has_order_error {
+            // Preamble: everything before the first H2
+            let first_h2_block = h2s.first().map(|(i, _, _)| *i).unwrap_or(doc.blocks.len());
+            let preamble = doc.blocks[..first_h2_block].to_vec();
+
+            // Extract each section as a Vec<Block> (heading + body)
+            let mut raw_sections: Vec<(Option<usize>, Vec<Block>)> = Vec::new();
+            for (pos_idx, (start, title, _)) in h2s.iter().enumerate() {
+                let end = h2s
+                    .get(pos_idx + 1)
+                    .map(|(i, _, _)| *i)
+                    .unwrap_or(doc.blocks.len());
+                let schema_idx = allowed_titles.iter().position(|s| *s == title.as_str());
+                raw_sections.push((schema_idx, doc.blocks[*start..end].to_vec()));
+            }
+
+            // Sort by schema index (unknown sections go to the end)
+            raw_sections.sort_by_key(|(idx, _)| idx.unwrap_or(usize::MAX));
+
+            let sorted_sections = raw_sections.into_iter().map(|(_, blocks)| blocks).collect();
+
+            out.push(Diagnostic::SectionsOutOfOrder {
+                preamble,
+                sorted_sections,
+            });
         }
     }
 
@@ -2310,6 +2352,67 @@ structure:
                 .iter()
                 .any(|d| matches!(d, Diagnostic::SectionOutOfOrder { .. })),
             "got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_section_order_emits_fixable_diagnostic() {
+        let yaml = r"
+structure:
+  sections:
+    - title: Alpha
+    - title: Beta
+    - title: Gamma
+";
+        let (schema, type_def) = make_schema("t", yaml);
+        // Gamma before Alpha → out of order
+        let doc = parse("---\ntype: t\n---\n# Doc\n\n## Gamma\n\nG content.\n\n## Alpha\n\nA content.\n\n## Beta\n\nB content.\n");
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
+            None,
+        );
+        // Individual per-section diagnostic
+        assert!(
+            diags
+                .iter()
+                .any(|d| matches!(d, Diagnostic::SectionOutOfOrder { .. })),
+            "should have SectionOutOfOrder: {diags:?}"
+        );
+        // Fixable aggregate diagnostic
+        let reorder = diags
+            .iter()
+            .find(|d| matches!(d, Diagnostic::SectionsOutOfOrder { .. }));
+        assert!(reorder.is_some(), "should have SectionsOutOfOrder: {diags:?}");
+        // All diagnostics should be fixable
+        assert!(
+            diags.iter().all(|d| crate::fix::Fix::is_fixable(d)),
+            "all diagnostics should be fixable: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_section_order_correct_no_reorder_diagnostic() {
+        let yaml = r"
+structure:
+  sections:
+    - title: Alpha
+    - title: Beta
+";
+        let (schema, type_def) = make_schema("t", yaml);
+        let doc = parse("---\ntype: t\n---\n## Alpha\n\n## Beta\n");
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
+            None,
+        );
+        assert!(
+            !diags
+                .iter()
+                .any(|d| matches!(d, Diagnostic::SectionsOutOfOrder { .. })),
+            "should not have SectionsOutOfOrder when in order: {diags:?}"
         );
     }
 

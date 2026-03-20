@@ -7,6 +7,8 @@ use crate::{
     ast::{Block, Document, Inline, ListItem},
     validate::{Diagnostic, SortedEntry},
 };
+#[cfg(test)]
+use crate::ast::inlines_to_string;
 
 // ── Fix ───────────────────────────────────────────────────────────────────────
 
@@ -60,6 +62,11 @@ pub enum Fix {
         /// Target: `true` for ordered, `false` for unordered.
         ordered: bool,
     },
+    /// Rebuild the document with sections in schema-defined order.
+    ReorderSections {
+        preamble: Vec<Block>,
+        sorted_sections: Vec<Vec<Block>>,
+    },
 }
 
 impl Fix {
@@ -75,6 +82,8 @@ impl Fix {
                 | Diagnostic::EmptyOptionalSection { .. }
                 | Diagnostic::SectionNotBullets { .. }
                 | Diagnostic::WrongListType { .. }
+                | Diagnostic::SectionOutOfOrder { .. }
+                | Diagnostic::SectionsOutOfOrder { .. }
         )
     }
 
@@ -119,8 +128,18 @@ impl Fix {
             Diagnostic::EmptyOptionalSection { section_ranges } => Some(Fix::RemoveEmptySections {
                 section_ranges: section_ranges.clone(),
             }),
+            Diagnostic::SectionsOutOfOrder {
+                preamble,
+                sorted_sections,
+            } => Some(Fix::ReorderSections {
+                preamble: preamble.clone(),
+                sorted_sections: sorted_sections.clone(),
+            }),
+            // SectionOutOfOrder is informational (per-section); the fix comes from SectionsOutOfOrder
             // SectionNotBullets and WrongListType are handled by build_content_fixes
-            Diagnostic::SectionNotBullets { .. } | Diagnostic::WrongListType { .. } => None,
+            Diagnostic::SectionOutOfOrder { .. }
+            | Diagnostic::SectionNotBullets { .. }
+            | Diagnostic::WrongListType { .. } => None,
             _ => None,
         }
     }
@@ -274,6 +293,16 @@ impl Fix {
                 }) = doc.blocks.get_mut(*list_index)
                 {
                     *current = *ordered;
+                }
+            }
+
+            Fix::ReorderSections {
+                preamble,
+                sorted_sections,
+            } => {
+                doc.blocks = preamble.clone();
+                for section in sorted_sections {
+                    doc.blocks.extend(section.clone());
                 }
             }
         }
@@ -693,6 +722,125 @@ mod tests {
             line: 5,
             context: "section 'Steps'".to_string(),
             expected: "ordered".to_string(),
+        }));
+    }
+
+    // ── ReorderSections ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_reorder_sections_swaps_two() {
+        let input = "---\ntype: t\n---\n# Doc\n\n## Beta\n\nBeta content.\n\n## Alpha\n\nAlpha content.\n";
+        let doc = parse(input);
+
+        // Find H2 block indices
+        let h2_indices: Vec<usize> = doc
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| match b {
+                Block::Heading { level: 2, .. } => Some(i),
+                _ => None,
+            })
+            .collect();
+
+        let first_h2 = h2_indices[0];
+        let second_h2 = h2_indices[1];
+        let preamble = doc.blocks[..first_h2].to_vec();
+        let beta_section = doc.blocks[first_h2..second_h2].to_vec();
+        let alpha_section = doc.blocks[second_h2..].to_vec();
+
+        let result = apply_and_serialize(
+            input,
+            &[Diagnostic::SectionsOutOfOrder {
+                preamble,
+                sorted_sections: vec![alpha_section, beta_section],
+            }],
+        );
+        let alpha_pos = result.find("## Alpha").expect("Alpha should exist");
+        let beta_pos = result.find("## Beta").expect("Beta should exist");
+        assert!(
+            alpha_pos < beta_pos,
+            "Alpha should come before Beta: {result}"
+        );
+    }
+
+    #[test]
+    fn test_reorder_sections_preserves_content() {
+        let input = "---\ntype: t\n---\n# Doc\n\n## Gamma\n\nG content.\n\n## Alpha\n\nA content.\n\n## Beta\n\nB content.\n";
+        let doc = parse(input);
+
+        // Build preamble + sorted sections from the parsed doc
+        // Blocks: [frontmatter, H1, blank, H2-Gamma, blank, para-G, blank, H2-Alpha, blank, para-A, blank, H2-Beta, blank, para-B]
+        let h2_indices: Vec<usize> = doc
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| match b {
+                Block::Heading { level: 2, .. } => Some(i),
+                _ => None,
+            })
+            .collect();
+
+        let first_h2 = h2_indices[0];
+        let preamble = doc.blocks[..first_h2].to_vec();
+
+        // Extract sections
+        let mut sections: Vec<(usize, Vec<Block>)> = Vec::new();
+        for (pos, &start) in h2_indices.iter().enumerate() {
+            let end = h2_indices.get(pos + 1).copied().unwrap_or(doc.blocks.len());
+            // Schema order: Alpha=0, Beta=1, Gamma=2
+            let order = match &doc.blocks[start] {
+                Block::Heading { content, .. } => {
+                    let title = inlines_to_string(content);
+                    match title.as_str() {
+                        "Alpha" => 0,
+                        "Beta" => 1,
+                        "Gamma" => 2,
+                        _ => 99,
+                    }
+                }
+                _ => 99,
+            };
+            sections.push((order, doc.blocks[start..end].to_vec()));
+        }
+        sections.sort_by_key(|(order, _)| *order);
+        let sorted_sections: Vec<Vec<Block>> =
+            sections.into_iter().map(|(_, blocks)| blocks).collect();
+
+        let result = apply_and_serialize(
+            input,
+            &[Diagnostic::SectionsOutOfOrder {
+                preamble,
+                sorted_sections,
+            }],
+        );
+
+        // Verify order
+        let alpha_pos = result.find("## Alpha").unwrap();
+        let beta_pos = result.find("## Beta").unwrap();
+        let gamma_pos = result.find("## Gamma").unwrap();
+        assert!(alpha_pos < beta_pos, "Alpha < Beta: {result}");
+        assert!(beta_pos < gamma_pos, "Beta < Gamma: {result}");
+
+        // Verify content preserved
+        assert!(result.contains("A content."), "Alpha content preserved: {result}");
+        assert!(result.contains("B content."), "Beta content preserved: {result}");
+        assert!(result.contains("G content."), "Gamma content preserved: {result}");
+    }
+
+    #[test]
+    fn test_is_fixable_section_out_of_order() {
+        assert!(Fix::is_fixable(&Diagnostic::SectionOutOfOrder {
+            line: 5,
+            section: "Alpha".to_string(),
+        }));
+    }
+
+    #[test]
+    fn test_is_fixable_sections_out_of_order() {
+        assert!(Fix::is_fixable(&Diagnostic::SectionsOutOfOrder {
+            preamble: vec![],
+            sorted_sections: vec![],
         }));
     }
 }
