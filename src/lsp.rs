@@ -93,7 +93,7 @@ fn validate_and_publish(
 ) -> Result<()> {
     let root = format::find_project_root(file_path).context("could not determine project root")?;
 
-    let file_errors = format::check_dir(&root)?;
+    let file_errors = format::check_dir(&root, &[])?;
 
     // Publish diagnostics for files with errors.
     let mut new_published: HashSet<PathBuf> = HashSet::new();

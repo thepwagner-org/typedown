@@ -16,9 +16,15 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Validate, fix, and format markdown files
-    Fmt,
+    Fmt {
+        /// Files to process (defaults to entire project)
+        paths: Vec<std::path::PathBuf>,
+    },
     /// Validate without writing (for CI)
-    Check,
+    Check {
+        /// Files to check (defaults to entire project)
+        paths: Vec<std::path::PathBuf>,
+    },
     /// Start Language Server Protocol server (diagnostics for markdown files)
     Lsp,
     /// Output documents as structured JSON (JSONL for multiple files)

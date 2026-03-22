@@ -9,10 +9,24 @@ mod parse;
 mod schema;
 mod validate;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+
+/// Resolve CLI path arguments to absolute paths relative to cwd.
+fn resolve_paths(cwd: &Path, paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .map(|p| {
+            if p.is_absolute() {
+                p.clone()
+            } else {
+                cwd.join(p)
+            }
+        })
+        .collect()
+}
 
 fn main() {
     let cli = cli::Cli::parse();
@@ -33,9 +47,9 @@ fn main() {
     let root = format::find_project_root(&cwd).unwrap_or_else(|| cwd.clone());
 
     match cli.command {
-        cli::Command::Fmt => {
+        cli::Command::Fmt { paths } => {
             let opts = format::FormatOptions { check: false };
-            match format::format_dir(&root, opts) {
+            match format::format_dir(&root, &resolve_paths(&cwd, &paths), opts) {
                 Ok(result) => {
                     if result.files_changed > 0 {
                         eprintln!(
@@ -44,9 +58,9 @@ fn main() {
                         );
                     }
                     for err in &result.errors {
-                        eprintln!("{}:", err.path.display());
                         for d in &err.diagnostics {
-                            eprintln!("  error: {}", d.message());
+                            let line = d.line().map(|l| format!(":{l}")).unwrap_or_default();
+                            eprintln!("{}{}:  {}", err.path.display(), line, d.message());
                         }
                     }
                     if !result.errors.is_empty() {
@@ -60,7 +74,7 @@ fn main() {
             }
         }
 
-        cli::Command::Check => match format::check_dir(&root) {
+        cli::Command::Check { paths } => match format::check_dir(&root, &resolve_paths(&cwd, &paths)) {
             Ok(errors) => {
                 for file_err in &errors {
                     for d in &file_err.diagnostics {

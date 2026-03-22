@@ -57,7 +57,7 @@ pub struct FileError {
 /// - Reads the `type` field from frontmatter to pick the schema type.
 /// - If no `type:` is present, tries path-pattern matching from `paths:` in schemas.
 /// - Validates, applies fixes (unless `check` mode), and writes if changed.
-pub fn format_dir(root: &Path, opts: FormatOptions) -> Result<FormatResult> {
+pub fn format_dir(root: &Path, explicit_paths: &[PathBuf], opts: FormatOptions) -> Result<FormatResult> {
     let mut result = FormatResult::default();
 
     // Pre-load schemas: schema_dir → Schema, and build path matchers.
@@ -94,41 +94,52 @@ pub fn format_dir(root: &Path, opts: FormatOptions) -> Result<FormatResult> {
         HashMap::new()
     };
 
-    // Collect all markdown paths (WalkDir is sequential by design).
-    let paths: Vec<PathBuf> = WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| !is_ignored(e.file_name().to_str().unwrap_or("")))
-        .filter_map(|e| e.ok())
-        .filter(|e| is_markdown(e.path()))
-        .map(|e| e.path().to_path_buf())
-        .collect();
+    // Collect markdown paths: use explicit paths if given, otherwise walk the tree.
+    let paths = resolve_file_args(root, explicit_paths);
 
     result.files_checked = paths.len();
 
     // Process files in parallel.  Each format_file call is independent: it
     // reads (from cache), applies fixes, and writes its own file.
-    let outcomes: Vec<Result<Option<bool>, (PathBuf, anyhow::Error)>> = paths
-        .par_iter()
-        .map(|path| {
-            format_file(
-                path,
-                root,
-                &schemas,
-                &matchers,
-                &linked_docs,
-                &doc_cache,
-                git_tree.as_ref(),
-                &external_types,
-                opts,
-            )
-            .map_err(|e| (path.clone(), e))
-        })
-        .collect();
+    let outcomes: Vec<Result<(Option<bool>, Vec<Diagnostic>, PathBuf), (PathBuf, anyhow::Error)>> =
+        paths
+            .par_iter()
+            .map(|path| {
+                format_file(
+                    path,
+                    root,
+                    &schemas,
+                    &matchers,
+                    &linked_docs,
+                    &doc_cache,
+                    git_tree.as_ref(),
+                    &external_types,
+                    opts,
+                )
+                .map(|(changed, diags)| (changed, diags, path.clone()))
+                .map_err(|e| (path.clone(), e))
+            })
+            .collect();
 
     for outcome in outcomes {
         match outcome {
-            Ok(Some(true)) => result.files_changed += 1,
-            Ok(Some(false)) | Ok(None) => {}
+            Ok((Some(true), unfixable, path)) => {
+                result.files_changed += 1;
+                if !unfixable.is_empty() {
+                    result.errors.push(FileError {
+                        path,
+                        diagnostics: unfixable,
+                    });
+                }
+            }
+            Ok((_, unfixable, path)) => {
+                if !unfixable.is_empty() {
+                    result.errors.push(FileError {
+                        path,
+                        diagnostics: unfixable,
+                    });
+                }
+            }
             Err((path, e)) => result.errors.push(FileError {
                 path,
                 diagnostics: vec![Diagnostic::UnknownType {
@@ -145,7 +156,7 @@ pub fn format_dir(root: &Path, opts: FormatOptions) -> Result<FormatResult> {
 /// Check all markdown files under `root` without writing anything.
 ///
 /// Returns diagnostics grouped by file.
-pub fn check_dir(root: &Path) -> Result<Vec<FileError>> {
+pub fn check_dir(root: &Path, explicit_paths: &[PathBuf]) -> Result<Vec<FileError>> {
     let mut result = FormatResult::default();
     let (schemas, matchers) = load_all_schemas(root, &mut result);
     debug!(schema_dirs = schemas.len(), "loaded schemas");
@@ -174,14 +185,8 @@ pub fn check_dir(root: &Path) -> Result<Vec<FileError>> {
 
     let mut file_errors: Vec<FileError> = result.errors; // schema load errors
 
-    // Collect all markdown paths (WalkDir is sequential by design).
-    let paths: Vec<PathBuf> = WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| !is_ignored(e.file_name().to_str().unwrap_or("")))
-        .filter_map(|e| e.ok())
-        .filter(|e| is_markdown(e.path()))
-        .map(|e| e.path().to_path_buf())
-        .collect();
+    // Collect markdown paths: use explicit paths if given, otherwise walk the tree.
+    let paths = resolve_file_args(root, explicit_paths);
 
     // Check files in parallel; each is independent (read-only validation).
     let parallel_errors: Vec<FileError> = paths
@@ -227,7 +232,7 @@ fn format_file(
     git_tree: Option<&std::collections::HashSet<PathBuf>>,
     external_types: &HashMap<String, TypeDef>,
     opts: FormatOptions,
-) -> Result<Option<bool>> {
+) -> Result<(Option<bool>, Vec<Diagnostic>)> {
     // Use the preloaded content+doc if available; otherwise read from disk.
     // For format mode we always need an owned (mutable) Document for fix
     // application, so we clone the cached doc rather than re-parsing from disk.
@@ -244,7 +249,7 @@ fn format_file(
     let rel = path.strip_prefix(root).unwrap_or(path);
     let Some((schema, schema_dir)) = find_schema_for(path, root, schemas) else {
         debug!(file = %rel.display(), "no schema covers file, skipping");
-        return Ok(None);
+        return Ok((None, vec![]));
     };
 
     // Resolve type: explicit frontmatter `type:` takes priority, then path patterns.
@@ -285,7 +290,7 @@ fn format_file(
             }
             diags
         }
-        ResolvedType::OptedOut => return Ok(Some(false)),
+        ResolvedType::OptedOut => return Ok((Some(false), vec![])),
         ResolvedType::Conflict(types) => {
             vec![Diagnostic::UnknownType {
                 line: 0,
@@ -326,14 +331,17 @@ fn format_file(
         debug!(file = %rel.display(), count = diagnostics.len(), "diagnostics found");
     }
 
-    // Don't auto-fix if there are unfixable diagnostics
-    let has_unfixable = diagnostics.iter().any(|d| !crate::fix::Fix::is_fixable(d));
-    if has_unfixable {
-        debug!(file = %rel.display(), "has unfixable diagnostics, skipping write");
-        return Ok(Some(false));
+    // Partition into fixable and unfixable diagnostics.
+    // Apply fixes for fixable ones; return unfixable ones to the caller.
+    let (fixable, unfixable): (Vec<_>, Vec<_>) = diagnostics
+        .into_iter()
+        .partition(|d| crate::fix::Fix::is_fixable(d));
+
+    if !unfixable.is_empty() {
+        debug!(file = %rel.display(), count = unfixable.len(), "unfixable diagnostics");
     }
 
-    apply_fixes(&mut doc, &diagnostics);
+    apply_fixes(&mut doc, &fixable);
     crate::parse::normalize_blank_lines(&mut doc.blocks);
     // Strip trailing blank lines so serialized output round-trips cleanly.
     while doc.blocks.last() == Some(&crate::ast::Block::BlankLine) {
@@ -363,7 +371,7 @@ fn format_file(
 
     if formatted == content {
         debug!(file = %rel.display(), "unchanged");
-        return Ok(Some(false));
+        return Ok((Some(false), unfixable));
     }
 
     if !opts.check {
@@ -373,7 +381,7 @@ fn format_file(
         debug!(file = %rel.display(), "would change (check mode)");
     }
 
-    Ok(Some(true))
+    Ok((Some(true), unfixable))
 }
 
 /// Check a single file and return any diagnostics (no writes).
@@ -1107,6 +1115,50 @@ pub(crate) fn find_project_root(start: &Path) -> Option<PathBuf> {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
+/// Resolve explicit file arguments into a list of markdown paths, or fall back
+/// to walking the entire project tree when no arguments are given.
+///
+/// Directories in `explicit_paths` are walked recursively.  Non-existent paths
+/// are silently skipped (the caller already has the full project tree for
+/// link-validation purposes).  When explicit paths are provided, a warning is
+/// emitted so that callers know to re-run without arguments for full coverage.
+fn resolve_file_args(root: &Path, explicit_paths: &[PathBuf]) -> Vec<PathBuf> {
+    if explicit_paths.is_empty() {
+        return WalkDir::new(root)
+            .into_iter()
+            .filter_entry(|e| !is_ignored(e.file_name().to_str().unwrap_or("")))
+            .filter_map(|e| e.ok())
+            .filter(|e| is_markdown(e.path()))
+            .map(|e| e.path().to_path_buf())
+            .collect();
+    }
+
+    let mut paths = Vec::new();
+    for p in explicit_paths {
+        if p.is_dir() {
+            let walked: Vec<PathBuf> = WalkDir::new(p)
+                .into_iter()
+                .filter_entry(|e| !is_ignored(e.file_name().to_str().unwrap_or("")))
+                .filter_map(|e| e.ok())
+                .filter(|e| is_markdown(e.path()))
+                .map(|e| e.path().to_path_buf())
+                .collect();
+            paths.extend(walked);
+        } else if p.is_file() && is_markdown(p) {
+            paths.push(p.clone());
+        } else if !p.exists() {
+            debug!("skipping non-existent path: {}", p.display());
+        }
+    }
+
+    eprintln!(
+        "warning: only checked {} file(s); re-run without file arguments to check everything",
+        paths.len(),
+    );
+
+    paths
+}
+
 pub(crate) fn is_markdown(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("md")
 }
@@ -1149,7 +1201,7 @@ mod tests {
         let dir = make_tree(&[("notes/hello.md", "# Hello\n\nJust a note.\n")]);
         let _guard = XDG_LOCK.lock().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
-        let result = format_dir(dir.path(), FormatOptions::default()).unwrap();
+        let result = format_dir(dir.path(), &[], FormatOptions::default()).unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
         drop(_guard);
         assert_eq!(result.files_changed, 0);
@@ -1165,7 +1217,7 @@ mod tests {
             ),
             ("note.md", "---\ntype: note\ntitle: Hello\n---\n# Hello\n"),
         ]);
-        let result = format_dir(dir.path(), FormatOptions::default()).unwrap();
+        let result = format_dir(dir.path(), &[], FormatOptions::default()).unwrap();
         assert_eq!(result.files_changed, 0);
         assert!(result.errors.is_empty());
     }
@@ -1182,13 +1234,16 @@ mod tests {
         ]);
 
         let original = fs::read_to_string(dir.path().join("note.md")).unwrap();
-        let result = format_dir(dir.path(), FormatOptions::default()).unwrap();
+        let result = format_dir(dir.path(), &[], FormatOptions::default()).unwrap();
 
-        // File should be unchanged (unfixable error)
+        // File should be unchanged (no fixable issues)
         let after = fs::read_to_string(dir.path().join("note.md")).unwrap();
         assert_eq!(original, after);
         // Result records 0 changes (file not written)
         assert_eq!(result.files_changed, 0);
+        // Unfixable errors are now reported
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].path.ends_with("note.md"));
     }
 
     // ── check_dir ─────────────────────────────────────────────────────────────
@@ -1202,7 +1257,7 @@ mod tests {
             ),
             ("note.md", "---\ntype: note\n---\n"),
         ]);
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         assert!(!errors.is_empty(), "expected validation errors, got none");
         assert!(errors[0]
             .diagnostics
@@ -1219,7 +1274,7 @@ mod tests {
             ),
             ("note.md", "---\ntype: note\ntitle: Hello\n---\n"),
         ]);
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
     }
 
@@ -1230,7 +1285,7 @@ mod tests {
         let dir = make_tree(&[("notes/hello.md", "# Hello\n")]);
         let _guard = XDG_LOCK.lock().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
         drop(_guard);
         assert!(errors.is_empty());
@@ -1248,7 +1303,7 @@ mod tests {
         ]);
 
         let original = fs::read_to_string(dir.path().join("my-note.md")).unwrap();
-        let _result = format_dir(dir.path(), FormatOptions { check: true }).unwrap();
+        let _result = format_dir(dir.path(), &[], FormatOptions { check: true }).unwrap();
         let after = fs::read_to_string(dir.path().join("my-note.md")).unwrap();
         assert_eq!(original, after, "check mode should not modify files");
     }
@@ -1268,7 +1323,7 @@ mod tests {
             ("README.md", "# Root\n"),
         ]);
 
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         // Only projects/build.md should have errors
         assert_eq!(errors.len(), 1);
         assert!(errors[0].path.ends_with("build.md"));
@@ -1285,20 +1340,10 @@ mod tests {
         let root = dir.path();
 
         // First pass — apply fixes
-        let result1 = format_dir(root, FormatOptions::default()).unwrap();
-        assert!(
-            result1.errors.is_empty(),
-            "first pass had errors: {:?}",
-            result1.errors
-        );
+        let _result1 = format_dir(root, &[], FormatOptions::default()).unwrap();
 
         // Second pass — nothing should change
-        let result2 = format_dir(root, FormatOptions::default()).unwrap();
-        assert!(
-            result2.errors.is_empty(),
-            "second pass had errors: {:?}",
-            result2.errors
-        );
+        let result2 = format_dir(root, &[], FormatOptions::default()).unwrap();
         assert_eq!(
             result2.files_changed, 0,
             "second pass changed files — fix is not idempotent"
@@ -1413,7 +1458,7 @@ mod tests {
             ),
         ]);
 
-        format_dir(dir.path(), FormatOptions::default()).unwrap();
+        format_dir(dir.path(), &[], FormatOptions::default()).unwrap();
 
         let result = fs::read_to_string(dir.path().join("doc.md")).unwrap();
         let alpha_pos = result.find("## Alpha").expect("Alpha present");
@@ -1423,7 +1468,7 @@ mod tests {
         assert!(result.contains("Beta content."), "Beta content preserved: {result}");
 
         // Second pass should be clean
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         assert!(errors.is_empty(), "should be clean after fmt: {errors:?}");
     }
 
@@ -1439,7 +1484,7 @@ mod tests {
             ),
             ("README.md", "---\ncreated: 2026-01-01\n---\n"),
         ]);
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         // Should not complain about missing `type:` field
         let type_errors: Vec<_> = errors
             .iter()
@@ -1462,7 +1507,7 @@ mod tests {
             ),
             ("ROADMAP.md", "# Roadmap\n\nSome content.\n"),
         ]);
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         assert!(
             errors.is_empty(),
             "path-matched file with no required fields should pass without frontmatter, got: {errors:?}"
@@ -1479,7 +1524,7 @@ mod tests {
             ),
             ("README.md", "# My Project\n"),
         ]);
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         assert!(
             !errors.is_empty(),
             "path-matched file with required fields and no frontmatter should have errors"
@@ -1497,7 +1542,7 @@ mod tests {
             ),
             ("README.md", "---\ntype: other\n---\n# Title\n"),
         ]);
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         assert!(
             errors
                 .iter()
@@ -1517,7 +1562,7 @@ mod tests {
             ),
             ("README.md", "---\ntype: none\n---\n"),
         ]);
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         assert!(
             errors.is_empty(),
             "type: none should opt out despite path match, got: {errors:?}"
@@ -1538,7 +1583,7 @@ mod tests {
             ),
             ("docs/hello.md", "# Hello\n"),
         ]);
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         let conflict_errors: Vec<_> = errors
             .iter()
             .flat_map(|e| &e.diagnostics)
@@ -1562,7 +1607,7 @@ mod tests {
             ("sub/AGENTS.md", "# Sub Agents\n"),
             ("deep/nested/AGENTS.md", "# Deep Agents\n"),
         ]);
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         assert!(
             errors.is_empty(),
             "** glob should match at all depths, got: {errors:?}"
@@ -1591,7 +1636,7 @@ mod tests {
             ),
             ("README.md", "---\ncreated: not-a-date\n---\n# Title\n"),
         ]);
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         assert!(
             errors
                 .iter()
@@ -1618,7 +1663,7 @@ mod tests {
             ),
         ]);
 
-        format_dir(dir.path(), FormatOptions::default()).unwrap();
+        format_dir(dir.path(), &[], FormatOptions::default()).unwrap();
 
         let content = fs::read_to_string(dir.path().join("skill.md")).unwrap();
         let name_count = content.matches("name:").count();
@@ -1658,7 +1703,7 @@ mod tests {
 
         let _guard = XDG_LOCK.lock().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
         drop(_guard);
 
@@ -1692,7 +1737,7 @@ mod tests {
 
         let _guard = XDG_LOCK.lock().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
         drop(_guard);
 
@@ -1721,7 +1766,7 @@ mod tests {
 
         let _guard = XDG_LOCK.lock().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
-        let errors = check_dir(dir.path()).unwrap();
+        let errors = check_dir(dir.path(), &[]).unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
         drop(_guard);
 
@@ -1787,7 +1832,7 @@ mod tests {
             ],
         );
 
-        let errors = check_dir(&proj_a).unwrap();
+        let errors = check_dir(&proj_a, &[]).unwrap();
         let type_mismatches: Vec<_> = errors
             .iter()
             .flat_map(|e| e.diagnostics.iter())
@@ -1819,7 +1864,7 @@ mod tests {
             ],
         );
 
-        let errors = check_dir(&proj_a).unwrap();
+        let errors = check_dir(&proj_a, &[]).unwrap();
         let has_mismatch = errors.iter().flat_map(|e| e.diagnostics.iter()).any(|d| {
             matches!(d, Diagnostic::LinkTargetTypeMismatch { expected, actual: Some(actual), .. }
                     if expected == "movie" && actual == "tvshow")
@@ -1848,7 +1893,7 @@ mod tests {
             ],
         );
 
-        let errors = check_dir(&proj_a).unwrap();
+        let errors = check_dir(&proj_a, &[]).unwrap();
         let has_mismatch = errors
             .iter()
             .flat_map(|e| e.diagnostics.iter())
@@ -1884,7 +1929,7 @@ mod tests {
             ],
         );
 
-        let errors = check_dir(&proj_a).unwrap();
+        let errors = check_dir(&proj_a, &[]).unwrap();
         let backlink_errors: Vec<_> = errors
             .iter()
             .flat_map(|e| e.diagnostics.iter())
@@ -1920,7 +1965,7 @@ mod tests {
             ],
         );
 
-        let errors = check_dir(&proj_a).unwrap();
+        let errors = check_dir(&proj_a, &[]).unwrap();
         let has_missing_backlink = errors
             .iter()
             .flat_map(|e| e.diagnostics.iter())
@@ -1962,7 +2007,7 @@ mod tests {
 
         let _guard = XDG_LOCK.lock().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
-        let errors = check_dir(&proj_a).unwrap();
+        let errors = check_dir(&proj_a, &[]).unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
         drop(_guard);
 
