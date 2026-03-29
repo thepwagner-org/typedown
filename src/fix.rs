@@ -3,12 +3,12 @@
 //! Fixes are separate from `Diagnostic` — they describe the action, not the
 //! problem. A fix operates on `&mut Document` and requires no I/O.
 
+#[cfg(test)]
+use crate::ast::inlines_to_string;
 use crate::{
     ast::{Block, Document, Inline, ListItem},
     validate::{Diagnostic, SortedEntry},
 };
-#[cfg(test)]
-use crate::ast::inlines_to_string;
 
 // ── Fix ───────────────────────────────────────────────────────────────────────
 
@@ -729,7 +729,8 @@ mod tests {
 
     #[test]
     fn test_reorder_sections_swaps_two() {
-        let input = "---\ntype: t\n---\n# Doc\n\n## Beta\n\nBeta content.\n\n## Alpha\n\nAlpha content.\n";
+        let input =
+            "---\ntype: t\n---\n# Doc\n\n## Beta\n\nBeta content.\n\n## Alpha\n\nAlpha content.\n";
         let doc = parse(input);
 
         // Find H2 block indices
@@ -823,9 +824,18 @@ mod tests {
         assert!(beta_pos < gamma_pos, "Beta < Gamma: {result}");
 
         // Verify content preserved
-        assert!(result.contains("A content."), "Alpha content preserved: {result}");
-        assert!(result.contains("B content."), "Beta content preserved: {result}");
-        assert!(result.contains("G content."), "Gamma content preserved: {result}");
+        assert!(
+            result.contains("A content."),
+            "Alpha content preserved: {result}"
+        );
+        assert!(
+            result.contains("B content."),
+            "Beta content preserved: {result}"
+        );
+        assert!(
+            result.contains("G content."),
+            "Gamma content preserved: {result}"
+        );
     }
 
     #[test]

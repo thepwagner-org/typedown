@@ -76,6 +76,12 @@ pub struct JsonSection {
     /// non-empty -- the structured list representation supersedes it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Section-level typed properties. Present when the schema declares
+    /// `properties` on the section and all list items are flat `Key: Value`
+    /// pairs (no sub-items). Mutually exclusive with `items` -- when
+    /// section-level properties are extracted, items are omitted.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub properties: IndexMap<String, serde_json::Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<JsonItem>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -614,10 +620,25 @@ fn make_section(
         Vec::new()
     };
 
+    // When the schema declares properties and all items are flat Key: Value
+    // pairs (no sub-items, no item-level properties), extract section-level
+    // properties and omit the redundant items array.
+    let section_props = properties
+        .filter(|_| !sc.items.is_empty())
+        .map(|p| extract_flat_section_properties(&sc.items, p))
+        .unwrap_or_default();
+
+    let items = if section_props.is_empty() {
+        sc.items
+    } else {
+        Vec::new()
+    };
+
     JsonSection {
         heading,
         content: sc.content,
-        items: sc.items,
+        properties: section_props,
+        items,
         links: sc.links,
         subsections,
     }
@@ -738,6 +759,41 @@ fn extract_item_properties(
     result
 }
 
+/// Extract section-level properties from flat `Key: Value` list items.
+///
+/// Applies when the schema declares `properties` on a section and ALL items are
+/// flat (no sub-items, no item-level properties already extracted).  Each item's
+/// text is split on `": "` and type-coerced against the schema.  Returns an
+/// empty map if items aren't uniformly flat Key: Value pairs.
+fn extract_flat_section_properties(
+    items: &[JsonItem],
+    properties_def: &IndexMap<String, FieldDef>,
+) -> IndexMap<String, serde_json::Value> {
+    // Only applies when ALL items are flat (no sub-items, no existing properties)
+    if items
+        .iter()
+        .any(|i| !i.items.is_empty() || !i.properties.is_empty())
+    {
+        return IndexMap::new();
+    }
+
+    let mut result = IndexMap::new();
+    for item in items {
+        if let Some((k, v)) = item.text.split_once(": ") {
+            let key = k.trim().to_lowercase();
+            let val_str = v.trim();
+            let json_val = if let Some(field_def) = properties_def.get(&key) {
+                coerce_property_str(val_str, field_def)
+            } else {
+                serde_json::Value::String(val_str.to_string())
+            };
+            result.insert(key, json_val);
+        }
+    }
+
+    result
+}
+
 /// Coerce a property value string to JSON using the declared field type.
 /// Delegates to `coerce_by_type` after wrapping the string as a YAML value —
 /// `coerce_by_type` already handles string-to-integer and string-to-bool
@@ -794,8 +850,8 @@ fn collect_block_links(block: &Block, links: &mut Vec<JsonLink>) {
 fn collect_inline_links(inlines: &[Inline], links: &mut Vec<JsonLink>) {
     for inline in inlines {
         match inline {
-            Inline::Link { text, url } => links.push(JsonLink {
-                text: text.clone(),
+            Inline::Link { content, url } => links.push(JsonLink {
+                text: inlines_to_string(content),
                 url: url.clone(),
             }),
             Inline::Strong(inner) | Inline::Emphasis(inner) | Inline::Strikethrough(inner) => {
@@ -1198,6 +1254,101 @@ mod tests {
         assert!(
             !json.contains("\"properties\""),
             "empty properties should be omitted: {json}"
+        );
+    }
+
+    // ── Flat section-level properties tests ─────────────────────────────────
+
+    #[test]
+    fn test_flat_section_properties_extracted() {
+        let type_def = make_type_def_with_properties(
+            "        size:\n          type: integer\n        audio:\n          type: string\n",
+        );
+        // Flat items (no parent bullet, no nesting)
+        let doc = mk("# T\n\n## Media\n\n- Size: 42\n- Audio: English\n");
+        let jdoc = document_to_json(
+            &doc,
+            Path::new("test.md"),
+            None,
+            Some(&type_def),
+            Path::new(""),
+        );
+        let sec = &jdoc.sections[0];
+        assert_eq!(
+            sec.properties.get("size"),
+            Some(&serde_json::Value::Number(42.into())),
+            "flat integer property should be type-coerced"
+        );
+        assert_eq!(
+            sec.properties.get("audio"),
+            Some(&serde_json::Value::String("English".to_string())),
+        );
+        assert!(
+            sec.items.is_empty(),
+            "items should be omitted when section properties are extracted"
+        );
+    }
+
+    #[test]
+    fn test_flat_section_properties_unknown_key_included() {
+        let type_def = make_type_def_with_properties("        size:\n          type: integer\n");
+        let doc = mk("# T\n\n## Media\n\n- Size: 10\n- Unknown: value\n");
+        let jdoc = document_to_json(
+            &doc,
+            Path::new("test.md"),
+            None,
+            Some(&type_def),
+            Path::new(""),
+        );
+        let sec = &jdoc.sections[0];
+        assert_eq!(
+            sec.properties.get("unknown"),
+            Some(&serde_json::Value::String("value".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_flat_properties_not_extracted_when_nested() {
+        // Nested items (parent + sub-items) should use item-level properties, not section-level.
+        let type_def = make_type_def_with_properties("        size:\n          type: integer\n");
+        let doc = mk("# T\n\n## Media\n\n- Bluray\n  - Size: 42\n");
+        let jdoc = document_to_json(
+            &doc,
+            Path::new("test.md"),
+            None,
+            Some(&type_def),
+            Path::new(""),
+        );
+        let sec = &jdoc.sections[0];
+        assert!(
+            sec.properties.is_empty(),
+            "section-level properties should be empty when items are nested"
+        );
+        assert_eq!(sec.items.len(), 1);
+        assert_eq!(
+            sec.items[0].properties.get("size"),
+            Some(&serde_json::Value::Number(42.into())),
+            "item-level properties should still work"
+        );
+    }
+
+    #[test]
+    fn test_flat_section_properties_lowercase_keys() {
+        let type_def =
+            make_type_def_with_properties("        off-peak kwh:\n          type: string\n");
+        let doc = mk("# T\n\n## Media\n\n- Off-peak kwh: 785.29\n");
+        let jdoc = document_to_json(
+            &doc,
+            Path::new("test.md"),
+            None,
+            Some(&type_def),
+            Path::new(""),
+        );
+        let sec = &jdoc.sections[0];
+        assert_eq!(
+            sec.properties.get("off-peak kwh"),
+            Some(&serde_json::Value::String("785.29".to_string())),
+            "keys should be lowercased to match schema"
         );
     }
 

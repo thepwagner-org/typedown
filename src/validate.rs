@@ -187,9 +187,7 @@ impl Diagnostic {
             Self::SectionOutOfOrder { section, .. } => {
                 format!("section '{section}' appears out of order")
             }
-            Self::SectionsOutOfOrder { .. } => {
-                "sections are out of order".to_string()
-            }
+            Self::SectionsOutOfOrder { .. } => "sections are out of order".to_string(),
             Self::SectionNotBullets { context, .. } => {
                 format!("{context}: only bullet lists are allowed here")
             }
@@ -1276,11 +1274,71 @@ fn validate_section_properties(
     section_title: &str,
     out: &mut Vec<Diagnostic>,
 ) {
-    for block in section_blocks {
-        if let Block::List { items, .. } = block {
-            for item in items {
-                validate_item_properties(item, properties_def, heading_line, section_title, out);
+    // Collect all top-level items across list blocks.
+    let all_items: Vec<&ListItem> = section_blocks
+        .iter()
+        .filter_map(|b| {
+            if let Block::List { items, .. } = b {
+                Some(items.iter())
+            } else {
+                None
             }
+        })
+        .flatten()
+        .collect();
+
+    // Detect flat section-level properties: every item is a plain `Key: Value`
+    // line with no sub-items (mirrors extract_flat_section_properties in json.rs).
+    let all_flat = !all_items.is_empty()
+        && all_items.iter().all(|item| {
+            item.children.is_empty() && inlines_to_string(&item.content).contains(": ")
+        });
+
+    if all_flat {
+        validate_flat_section_properties(
+            &all_items,
+            properties_def,
+            heading_line,
+            section_title,
+            out,
+        );
+    } else {
+        for item in &all_items {
+            validate_item_properties(item, properties_def, heading_line, section_title, out);
+        }
+    }
+}
+
+/// Validate flat `- Key: Value` bullets as section-level properties.
+fn validate_flat_section_properties(
+    items: &[&ListItem],
+    properties_def: &indexmap::IndexMap<String, FieldDef>,
+    heading_line: usize,
+    section_title: &str,
+    out: &mut Vec<Diagnostic>,
+) {
+    let mut found: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for item in items {
+        let text = inlines_to_string(&item.content);
+        if let Some((k, v)) = text.split_once(": ") {
+            found.insert(k.trim().to_lowercase(), v.trim().to_string());
+        }
+    }
+
+    for (prop_name, prop_def) in properties_def {
+        if let Some(value_str) = found.get(prop_name.as_str()) {
+            if let Some(msg) = validate_property_str(value_str, prop_def) {
+                out.push(Diagnostic::InvalidFieldType {
+                    line: heading_line,
+                    field: format!("{section_title}/{prop_name}"),
+                    message: msg,
+                });
+            }
+        } else if prop_def.required {
+            out.push(Diagnostic::MissingRequiredField {
+                line: heading_line,
+                field: format!("{section_title}/{prop_name}"),
+            });
         }
     }
 }
@@ -2384,7 +2442,10 @@ structure:
         let reorder = diags
             .iter()
             .find(|d| matches!(d, Diagnostic::SectionsOutOfOrder { .. }));
-        assert!(reorder.is_some(), "should have SectionsOutOfOrder: {diags:?}");
+        assert!(
+            reorder.is_some(),
+            "should have SectionsOutOfOrder: {diags:?}"
+        );
         // All diagnostics should be fixable
         assert!(
             diags.iter().all(|d| crate::fix::Fix::is_fixable(d)),
@@ -3669,6 +3730,52 @@ structure:
         let diags = validate_props(
             "# Title\n\n## Media\n\n- Bluray\n  - Released: 2001-07-20\n",
             "        released:\n          type: date\n          required: true\n",
+        );
+        assert!(diags.is_empty(), "expected no errors, got: {diags:?}");
+    }
+
+    #[test]
+    fn test_flat_properties_valid_passes() {
+        let diags = validate_props(
+            "# Title\n\n## Media\n\n- Size: 42\n- Audio: English\n",
+            "        size:\n          type: integer\n          required: true\n        audio:\n          type: string\n          required: true\n",
+        );
+        assert!(diags.is_empty(), "expected no errors, got: {diags:?}");
+    }
+
+    #[test]
+    fn test_flat_properties_missing_required() {
+        let diags = validate_props(
+            "# Title\n\n## Media\n\n- Audio: English\n",
+            "        size:\n          type: integer\n          required: true\n        audio:\n          type: string\n",
+        );
+        assert!(
+            diags.iter().any(|d| matches!(d,
+                Diagnostic::MissingRequiredField { field, .. } if field.contains("size")
+            )),
+            "expected missing size, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_flat_properties_invalid_integer() {
+        let diags = validate_props(
+            "# Title\n\n## Media\n\n- Size: not-a-number\n- Audio: English\n",
+            "        size:\n          type: integer\n          required: true\n        audio:\n          type: string\n          required: true\n",
+        );
+        assert!(
+            diags.iter().any(|d| matches!(d,
+                Diagnostic::InvalidFieldType { field, .. } if field.contains("size")
+            )),
+            "expected invalid integer for size, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_flat_properties_optional_absent_ok() {
+        let diags = validate_props(
+            "# Title\n\n## Media\n\n- Size: 42\n",
+            "        size:\n          type: integer\n          required: true\n        subtitles:\n          type: string\n",
         );
         assert!(diags.is_empty(), "expected no errors, got: {diags:?}");
     }

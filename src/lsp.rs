@@ -118,13 +118,27 @@ fn validate_and_publish(
             })
             .collect();
 
-        publish_diagnostics(connection, &file_error.path, diagnostics)?;
-        new_published.insert(file_error.path.clone());
+        match publish_diagnostics(connection, &file_error.path, diagnostics) {
+            Ok(()) => {
+                new_published.insert(file_error.path.clone());
+            }
+            Err(e) => {
+                eprintln!(
+                    "failed to publish diagnostics for {}: {e:#}",
+                    file_error.path.display()
+                );
+            }
+        }
     }
 
     // Clear diagnostics for files that previously had errors but are now clean.
     for old_path in published_files.difference(&new_published) {
-        publish_diagnostics(connection, old_path, vec![])?;
+        if let Err(e) = publish_diagnostics(connection, old_path, vec![]) {
+            eprintln!(
+                "failed to clear diagnostics for {}: {e:#}",
+                old_path.display()
+            );
+        }
     }
 
     *published_files = new_published;
@@ -159,17 +173,43 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(decoded))
 }
 
-/// Convert a filesystem path to a `file://` URI.
+/// Convert a filesystem path to a `file://` URI with proper percent-encoding.
 fn path_to_uri(path: &Path) -> Result<Uri> {
     let abs = if path.is_absolute() {
         path.to_string_lossy().to_string()
     } else {
         return Err(anyhow::anyhow!("path must be absolute: {}", path.display()));
     };
-    format!("file://{abs}")
+    let encoded = percent_encode_path(&abs);
+    format!("file://{encoded}")
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid URI for {}: {e}", path.display()))
 }
+
+/// Percent-encode a filesystem path for use in a URI.
+/// Encodes everything except unreserved chars (RFC 3986) and `/`.
+fn percent_encode_path(path: &str) -> String {
+    let mut result = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            // unreserved: ALPHA / DIGIT / "-" / "." / "_" / "~"
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                result.push(byte as char);
+            }
+            // path separator
+            b'/' => result.push('/'),
+            // everything else (spaces, parens, etc.)
+            _ => {
+                result.push('%');
+                result.push(HEX_CHARS[(byte >> 4) as usize] as char);
+                result.push(HEX_CHARS[(byte & 0x0F) as usize] as char);
+            }
+        }
+    }
+    result
+}
+
+const HEX_CHARS: &[u8; 16] = b"0123456789ABCDEF";
 
 /// Decode percent-encoded bytes in a URI path.
 fn percent_decode(input: &str) -> String {
@@ -245,6 +285,28 @@ mod tests {
     fn test_path_to_uri_roundtrip() {
         let original = PathBuf::from("/Users/test/doc.md");
         let uri = path_to_uri(&original).unwrap();
+        let recovered = uri_to_path(uri.as_str()).unwrap();
+        assert_eq!(original, recovered);
+    }
+
+    #[test]
+    fn test_path_to_uri_with_spaces() {
+        let original = PathBuf::from("/Users/test/my file.md");
+        let uri = path_to_uri(&original).unwrap();
+        assert!(uri.as_str().contains("my%20file.md"));
+        let recovered = uri_to_path(uri.as_str()).unwrap();
+        assert_eq!(original, recovered);
+    }
+
+    #[test]
+    fn test_path_to_uri_with_parens_and_spaces() {
+        let original = PathBuf::from("/Users/test/docs/Project Plan (Draft 2).md");
+        let uri = path_to_uri(&original).unwrap();
+        assert!(
+            !uri.as_str().contains(' '),
+            "URI must not contain raw spaces"
+        );
+        assert!(uri.as_str().contains("%28"), "parens must be encoded");
         let recovered = uri_to_path(uri.as_str()).unwrap();
         assert_eq!(original, recovered);
     }

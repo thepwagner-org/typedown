@@ -57,7 +57,11 @@ pub struct FileError {
 /// - Reads the `type` field from frontmatter to pick the schema type.
 /// - If no `type:` is present, tries path-pattern matching from `paths:` in schemas.
 /// - Validates, applies fixes (unless `check` mode), and writes if changed.
-pub fn format_dir(root: &Path, explicit_paths: &[PathBuf], opts: FormatOptions) -> Result<FormatResult> {
+pub fn format_dir(
+    root: &Path,
+    explicit_paths: &[PathBuf],
+    opts: FormatOptions,
+) -> Result<FormatResult> {
     let mut result = FormatResult::default();
 
     // Pre-load schemas: schema_dir → Schema, and build path matchers.
@@ -1463,9 +1467,18 @@ mod tests {
         let result = fs::read_to_string(dir.path().join("doc.md")).unwrap();
         let alpha_pos = result.find("## Alpha").expect("Alpha present");
         let beta_pos = result.find("## Beta").expect("Beta present");
-        assert!(alpha_pos < beta_pos, "Alpha should come before Beta: {result}");
-        assert!(result.contains("Alpha content."), "Alpha content preserved: {result}");
-        assert!(result.contains("Beta content."), "Beta content preserved: {result}");
+        assert!(
+            alpha_pos < beta_pos,
+            "Alpha should come before Beta: {result}"
+        );
+        assert!(
+            result.contains("Alpha content."),
+            "Alpha content preserved: {result}"
+        );
+        assert!(
+            result.contains("Beta content."),
+            "Beta content preserved: {result}"
+        );
 
         // Second pass should be clean
         let errors = check_dir(dir.path(), &[]).unwrap();
@@ -2021,5 +2034,4 @@ mod tests {
             "preset movie type should resolve for cross-project target, got: {type_mismatches:?}"
         );
     }
-
 }

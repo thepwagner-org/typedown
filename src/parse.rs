@@ -1,7 +1,7 @@
 //! Markdown parsing and serialization using pulldown-cmark.
 
 use crate::ast::{
-    inlines_to_string, Block, ColumnAlignment, Document, Frontmatter, Inline, ListItem,
+    Block, ColumnAlignment, Document, Frontmatter, Inline, ListItem,
 };
 use gray_matter::{engine::YAML, Matter};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -249,17 +249,15 @@ fn collect_inlines(events: &mut VecDeque<Event>, end_tag: TagEnd) -> Vec<Inline>
             }
             Event::Start(Tag::Link { dest_url, .. }) => {
                 let inner = collect_inlines(events, TagEnd::Link);
-                let text = inlines_to_string(&inner);
                 inlines.push(Inline::Link {
-                    text,
+                    content: inner,
                     url: dest_url.to_string(),
                 });
             }
             Event::Start(Tag::Image { dest_url, .. }) => {
                 let inner = collect_inlines(events, TagEnd::Image);
-                let alt = inlines_to_string(&inner);
                 inlines.push(Inline::Image {
-                    alt,
+                    content: inner,
                     url: dest_url.to_string(),
                 });
             }
@@ -367,18 +365,16 @@ fn collect_item_content(events: &mut VecDeque<Event>) -> (Vec<Inline>, Vec<Block
             }
             Event::Start(Tag::Link { dest_url, .. }) => {
                 let inner = collect_inlines(events, TagEnd::Link);
-                let text = inlines_to_string(&inner);
                 inlines.push(Inline::Link {
-                    text,
+                    content: inner,
                     url: dest_url.to_string(),
                 });
                 first_paragraph = false;
             }
             Event::Start(Tag::Image { dest_url, .. }) => {
                 let inner = collect_inlines(events, TagEnd::Image);
-                let alt = inlines_to_string(&inner);
                 inlines.push(Inline::Image {
-                    alt,
+                    content: inner,
                     url: dest_url.to_string(),
                 });
                 first_paragraph = false;
@@ -601,11 +597,19 @@ fn serialize_inlines(inlines: &[Inline]) -> String {
                 out.push_str(&serialize_inlines(inner));
                 out.push_str("~~");
             }
-            Inline::Link { text, url } => {
-                out.push_str(&format!("[{text}]({url})"));
+            Inline::Link { content, url } => {
+                out.push('[');
+                out.push_str(&serialize_inlines(content));
+                out.push_str("](");
+                out.push_str(url);
+                out.push(')');
             }
-            Inline::Image { alt, url } => {
-                out.push_str(&format!("![{alt}]({url})"));
+            Inline::Image { content, url } => {
+                out.push_str("![");
+                out.push_str(&serialize_inlines(content));
+                out.push_str("](");
+                out.push_str(url);
+                out.push(')');
             }
             Inline::Code(s) => {
                 out.push_str(&crate::ast::format_code_span(s));
@@ -623,14 +627,19 @@ fn serialize_list(out: &mut String, items: &[ListItem], ordered: bool, indent: &
         } else {
             "-".to_string()
         };
+        // Continuation indent: spaces to align with the text that follows the marker.
+        // e.g. "- " → 2 spaces, "1. " → 3 spaces, "10. " → 4 spaces.
+        let continuation = format!("{}{}", indent, " ".repeat(marker.len() + 1));
         out.push_str(indent);
         out.push_str(&marker);
         out.push(' ');
-        out.push_str(&serialize_inlines(&item.content));
+        // SoftBreaks inside item content produce bare '\n'. Re-indent each
+        // continuation line so it aligns with the first character of the item text.
+        let content = serialize_inlines(&item.content);
+        out.push_str(&content.replace('\n', &format!("\n{continuation}")));
         out.push('\n');
         if !item.children.is_empty() {
-            let child_indent = format!("{indent}   ");
-            write_blocks(out, &item.children, &child_indent);
+            write_blocks(out, &item.children, &continuation);
         }
     }
 }
@@ -1041,10 +1050,16 @@ mod tests {
         let doc = parse("Check out [this link](https://example.com)\n");
         if let Block::Paragraph { content, .. } = &doc.blocks[0] {
             let has_link = content.iter().any(|i| {
-                matches!(i, Inline::Link { text, url }
-                    if text == "this link" && url == "https://example.com")
+                matches!(i, Inline::Link { url, .. }
+                    if url == "https://example.com")
             });
             assert!(has_link);
+            // Verify the link text via inlines_to_string
+            if let Some(Inline::Link { content: inner, .. }) =
+                content.iter().find(|i| matches!(i, Inline::Link { .. }))
+            {
+                assert_eq!(crate::ast::inlines_to_string(inner), "this link");
+            }
         } else {
             panic!("expected paragraph");
         }
@@ -1055,10 +1070,16 @@ mod tests {
         let doc = parse("![alt text](image.png)\n");
         if let Block::Paragraph { content, .. } = &doc.blocks[0] {
             let has_image = content.iter().any(|i| {
-                matches!(i, Inline::Image { alt, url }
-                    if alt == "alt text" && url == "image.png")
+                matches!(i, Inline::Image { url, .. }
+                    if url == "image.png")
             });
             assert!(has_image);
+            // Verify the alt text via inlines_to_string
+            if let Some(Inline::Image { content: inner, .. }) =
+                content.iter().find(|i| matches!(i, Inline::Image { .. }))
+            {
+                assert_eq!(crate::ast::inlines_to_string(inner), "alt text");
+            }
         } else {
             panic!("expected paragraph");
         }
@@ -1196,6 +1217,55 @@ mod tests {
         assert!(out.contains("**First**"));
         assert!(out.contains("   - sub a"));
         assert!(out.contains("**Second**"));
+    }
+
+    #[test]
+    fn test_roundtrip_list_item_multiline_unordered() {
+        // A bullet whose text wraps via soft-break must preserve continuation indentation.
+        // pulldown-cmark strips leading whitespace from continuation lines, so the
+        // serializer must re-add it (2 spaces to align after "- ").
+        let input = "- Named topic clusters with specific entities (ship names, legislation,\n  geographic chokepoints, people) — not vague categories\n";
+        let out = roundtrip(input);
+        assert!(
+            out.contains("  geographic chokepoints"),
+            "continuation line lost indentation:\n{out}"
+        );
+        // The first line should not have extra indentation
+        assert!(
+            out.contains("- Named topic clusters"),
+            "bullet marker mangled:\n{out}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_list_item_multiline_ordered() {
+        // An ordered item whose text wraps via soft-break must preserve continuation
+        // indentation (3 spaces to align after "1. ").
+        let input = "1. **Acknowledge the connection.** \"You've watched a lot of Sal's coverage\n   on this — his channel covers [topic] extensively.\"\n";
+        let out = roundtrip(input);
+        assert!(
+            out.contains("   on this"),
+            "continuation line lost indentation:\n{out}"
+        );
+        assert!(
+            out.contains("1. **Acknowledge"),
+            "ordered marker mangled:\n{out}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_list_item_multiple_soft_breaks() {
+        // Multiple continuation lines in one bullet must all be indented.
+        let input = "- **Offer to fetch specific videos.** \"Want me to pull\n  the transcript from Sal's explainer on the dark fleet? That\n  one's more evergreen than his daily updates.\"\n";
+        let out = roundtrip(input);
+        assert!(
+            out.contains("  the transcript"),
+            "second continuation line lost indentation:\n{out}"
+        );
+        assert!(
+            out.contains("  one's more evergreen"),
+            "third continuation line lost indentation:\n{out}"
+        );
     }
 
     #[test]
@@ -1391,5 +1461,41 @@ echo "done"
             .filter(|b| matches!(b, Block::Paragraph { .. }))
             .count();
         assert_eq!(para_count, 3, "expected 3 paragraphs, got {para_count}");
+    }
+
+    // ── Link text with emphasis-like characters ───────────────────────────────
+
+    #[test]
+    fn test_roundtrip_link_with_asterisks_in_text() {
+        // M*A*S*H contains asterisks that pulldown-cmark parses as emphasis.
+        // The formatter must preserve them in the serialized link text.
+        let input = "- [M*A*S*H](../tvshows/MASH/README.md) S01E03\n";
+        let out = roundtrip(input);
+        assert!(
+            out.contains("[M*A*S*H]"),
+            "asterisks in link text lost:\n{out}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_link_with_bold_in_text() {
+        // Bold inside link text must survive roundtrip.
+        let input = "See [the **important** docs](https://example.com) for details.\n";
+        let out = roundtrip(input);
+        assert!(
+            out.contains("[the **important** docs]"),
+            "bold in link text lost:\n{out}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_image_with_emphasis_in_alt() {
+        // Emphasis inside image alt text must survive roundtrip.
+        let input = "![A *very* important diagram](diagram.png)\n";
+        let out = roundtrip(input);
+        assert!(
+            out.contains("![A *very* important diagram]"),
+            "emphasis in alt text lost:\n{out}"
+        );
     }
 }

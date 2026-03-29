@@ -128,8 +128,8 @@ pub enum Inline {
     Strong(Vec<Inline>),
     Emphasis(Vec<Inline>),
     Strikethrough(Vec<Inline>),
-    Link { text: String, url: String },
-    Image { alt: String, url: String },
+    Link { content: Vec<Inline>, url: String },
+    Image { content: Vec<Inline>, url: String },
     Code(String),
     SoftBreak,
 }
@@ -178,8 +178,8 @@ pub fn inlines_to_string(inlines: &[Inline]) -> String {
             Inline::Strong(inner) | Inline::Emphasis(inner) | Inline::Strikethrough(inner) => {
                 out.push_str(&inlines_to_string(inner));
             }
-            Inline::Link { text, .. } => out.push_str(text),
-            Inline::Image { alt, .. } => out.push_str(alt),
+            Inline::Link { content, .. } => out.push_str(&inlines_to_string(content)),
+            Inline::Image { content, .. } => out.push_str(&inlines_to_string(content)),
             Inline::Code(s) => out.push_str(s),
             Inline::SoftBreak => out.push(' '),
         }
@@ -208,16 +208,16 @@ pub fn inlines_to_markdown(inlines: &[Inline]) -> String {
                 out.push_str(&inlines_to_markdown(inner));
                 out.push_str("~~");
             }
-            Inline::Link { text, url } => {
+            Inline::Link { content, url } => {
                 out.push('[');
-                out.push_str(text);
+                out.push_str(&inlines_to_markdown(content));
                 out.push_str("](");
                 out.push_str(url);
                 out.push(')');
             }
-            Inline::Image { alt, url } => {
+            Inline::Image { content, url } => {
                 out.push_str("![");
-                out.push_str(alt);
+                out.push_str(&inlines_to_markdown(content));
                 out.push_str("](");
                 out.push_str(url);
                 out.push(')');
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn test_inlines_to_string_link_uses_text() {
         let inlines = vec![Inline::Link {
-            text: "click here".to_string(),
+            content: vec![Inline::Text("click here".to_string())],
             url: "https://example.com".to_string(),
         }];
         assert_eq!(inlines_to_string(&inlines), "click here");
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn test_inlines_to_markdown_link() {
         let inlines = vec![Inline::Link {
-            text: "docs".to_string(),
+            content: vec![Inline::Text("docs".to_string())],
             url: "https://example.com".to_string(),
         }];
         assert_eq!(inlines_to_markdown(&inlines), "[docs](https://example.com)");

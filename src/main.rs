@@ -74,23 +74,25 @@ fn main() {
             }
         }
 
-        cli::Command::Check { paths } => match format::check_dir(&root, &resolve_paths(&cwd, &paths)) {
-            Ok(errors) => {
-                for file_err in &errors {
-                    for d in &file_err.diagnostics {
-                        let line = d.line().map(|l| format!(":{l}")).unwrap_or_default();
-                        eprintln!("{}{}:  {}", file_err.path.display(), line, d.message());
+        cli::Command::Check { paths } => {
+            match format::check_dir(&root, &resolve_paths(&cwd, &paths)) {
+                Ok(errors) => {
+                    for file_err in &errors {
+                        for d in &file_err.diagnostics {
+                            let line = d.line().map(|l| format!(":{l}")).unwrap_or_default();
+                            eprintln!("{}{}:  {}", file_err.path.display(), line, d.message());
+                        }
+                    }
+                    if !errors.is_empty() {
+                        std::process::exit(1);
                     }
                 }
-                if !errors.is_empty() {
+                Err(e) => {
+                    eprintln!("error: {e}");
                     std::process::exit(1);
                 }
             }
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        },
+        }
 
         cli::Command::Lsp => {
             if let Err(e) = lsp::run() {
