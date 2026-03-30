@@ -1,8 +1,6 @@
 //! Markdown parsing and serialization using pulldown-cmark.
 
-use crate::ast::{
-    Block, ColumnAlignment, Document, Frontmatter, Inline, ListItem,
-};
+use crate::ast::{Block, ColumnAlignment, Document, Frontmatter, Inline, ListItem};
 use gray_matter::{engine::YAML, Matter};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::collections::{HashSet, VecDeque};

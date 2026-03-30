@@ -1,0 +1,14 @@
+description: Project README with required frontmatter and full link validation.
+paths:
+  - "**/README.md"
+
+fields:
+  created:
+    type: date
+    required: true
+  description:
+    type: string
+    required: true
+
+structure:
+  title: from_directory

@@ -105,25 +105,25 @@ pub fn format_dir(
 
     // Process files in parallel.  Each format_file call is independent: it
     // reads (from cache), applies fixes, and writes its own file.
-    let outcomes: Vec<Result<(Option<bool>, Vec<Diagnostic>, PathBuf), (PathBuf, anyhow::Error)>> =
-        paths
-            .par_iter()
-            .map(|path| {
-                format_file(
-                    path,
-                    root,
-                    &schemas,
-                    &matchers,
-                    &linked_docs,
-                    &doc_cache,
-                    git_tree.as_ref(),
-                    &external_types,
-                    opts,
-                )
-                .map(|(changed, diags)| (changed, diags, path.clone()))
-                .map_err(|e| (path.clone(), e))
-            })
-            .collect();
+    type FormatOutcome = Result<(Option<bool>, Vec<Diagnostic>, PathBuf), (PathBuf, anyhow::Error)>;
+    let outcomes: Vec<FormatOutcome> = paths
+        .par_iter()
+        .map(|path| {
+            format_file(
+                path,
+                root,
+                &schemas,
+                &matchers,
+                &linked_docs,
+                &doc_cache,
+                git_tree.as_ref(),
+                &external_types,
+                opts,
+            )
+            .map(|(changed, diags)| (changed, diags, path.clone()))
+            .map_err(|e| (path.clone(), e))
+        })
+        .collect();
 
     for outcome in outcomes {
         match outcome {
@@ -304,7 +304,16 @@ fn format_file(
                 ),
             }]
         }
-        ResolvedType::Unknown => validate_unknown_type(&doc, schema),
+        ResolvedType::Unknown => {
+            // Virtual root schema (from built-in/XDG presets, no local .typedown/)
+            // only validates files that match a path pattern. Unmatched files are
+            // silently skipped — the project didn't opt into full schema coverage.
+            if !schema_dir.exists() {
+                debug!(file = %rel.display(), "no path match under virtual schema, skipping");
+                return Ok((None, vec![]));
+            }
+            validate_unknown_type(&doc, schema)
+        }
     };
 
     // Scan raw source for malformed links (spaces in URLs that the parser
@@ -339,7 +348,7 @@ fn format_file(
     // Apply fixes for fixable ones; return unfixable ones to the caller.
     let (fixable, unfixable): (Vec<_>, Vec<_>) = diagnostics
         .into_iter()
-        .partition(|d| crate::fix::Fix::is_fixable(d));
+        .partition(crate::fix::Fix::is_fixable);
 
     if !unfixable.is_empty() {
         debug!(file = %rel.display(), count = unfixable.len(), "unfixable diagnostics");
@@ -500,7 +509,13 @@ fn check_document(
                 ),
             }]
         }
-        ResolvedType::Unknown => validate_unknown_type(doc, schema),
+        ResolvedType::Unknown => {
+            if !schema_dir.exists() {
+                debug!(file = %rel.display(), "no path match under virtual schema, skipping");
+                return vec![];
+            }
+            validate_unknown_type(doc, schema)
+        }
     };
 
     // Suppress MissingFrontmatter for path-matched files with no required fields

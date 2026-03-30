@@ -1,0 +1,24 @@
+description: >-
+  A slash command (OpenCode or Claude Code). The markdown body is the prompt
+  template sent to the LLM when the command is invoked.
+paths:
+  - "commands/*.md"
+  - ".claude/commands/*.md"
+
+fields:
+  description:
+    type: string
+  agent:
+    type: string
+  model:
+    type: string
+  subtask:
+    type: bool
+  name:
+    type: string
+  allowed-tools:
+    type: string
+
+structure:
+  title: none
+  strict_sections: false

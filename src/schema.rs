@@ -36,12 +36,45 @@ fn presets_dir_under(config_home: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Load presets from the XDG presets directory.
+/// Built-in presets embedded at compile time from `presets/*.yaml`.
+const BUILTIN_PRESETS: &[(&str, &str)] = &[
+    ("agent", include_str!("../presets/agent.yaml")),
+    ("agents", include_str!("../presets/agents.yaml")),
+    ("command", include_str!("../presets/command.yaml")),
+    ("journal", include_str!("../presets/journal.yaml")),
+    ("readme", include_str!("../presets/readme.yaml")),
+    ("skill", include_str!("../presets/skill.yaml")),
+    ("roadmap", include_str!("../presets/roadmap.yaml")),
+];
+
+/// Load built-in presets, then overlay any XDG presets on top.
 ///
-/// Returns `None` if the directory doesn't exist or fails to load.
+/// Built-in presets ship with the binary. XDG presets (`~/.config/typedown/presets/`)
+/// override built-ins by type name — a local `readme.yaml` replaces the built-in one.
 pub fn load_presets() -> Option<Schema> {
-    let dir = presets_dir()?;
-    Schema::load(&dir).ok()
+    let mut schema = Schema::default();
+
+    // 1. Load built-ins
+    for (name, content) in BUILTIN_PRESETS {
+        if let Ok(type_def) = serde_yaml::from_str::<TypeDef>(content) {
+            schema.types.insert((*name).to_string(), type_def);
+        }
+    }
+
+    // 2. Overlay XDG presets (override by type name)
+    if let Some(dir) = presets_dir() {
+        if let Ok(xdg) = Schema::load(&dir) {
+            for (name, type_def) in xdg.types {
+                schema.types.insert(name, type_def);
+            }
+        }
+    }
+
+    if schema.types.is_empty() {
+        None
+    } else {
+        Some(schema)
+    }
 }
 
 /// A schema: a collection of named type definitions loaded from a `.typedown/` dir.

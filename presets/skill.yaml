@@ -1,0 +1,25 @@
+description: >-
+  A coding agent skill (SKILL.md). Provides reusable instructions loaded
+  on-demand via the skill tool. The directory name must match the frontmatter
+  name field.
+paths:
+  - "skills/*/SKILL.md"
+  - ".opencode/skills/*/SKILL.md"
+  - ".claude/skills/*/SKILL.md"
+  - ".agents/skills/*/SKILL.md"
+
+fields:
+  name:
+    type: string
+    required: true
+  description:
+    type: string
+    required: true
+  license:
+    type: string
+  compatibility:
+    type: string
+
+structure:
+  title: none
+  strict_sections: false

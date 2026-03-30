@@ -1,0 +1,11 @@
+description: Future possibilities and explicit non-goals for a project.
+paths:
+  - "**/ROADMAP.md"
+
+structure:
+  title: Roadmap
+  strict_sections: false
+  sections:
+    - title: Non-Goals
+      required: true
+      intro_text: "Explicitly out of scope to keep the project focused:"
