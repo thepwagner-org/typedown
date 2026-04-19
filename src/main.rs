@@ -6,6 +6,7 @@ mod git;
 mod json;
 mod lsp;
 mod parse;
+mod query;
 mod schema;
 mod validate;
 
@@ -111,5 +112,68 @@ fn main() {
                 std::process::exit(1);
             }
         }
+
+        cli::Command::Query {
+            paths,
+            type_name,
+            filename_glob,
+            last,
+            days,
+            grep,
+            has_link,
+            property,
+            json,
+            count,
+            paths_only,
+        } => {
+            let properties = match query::parse_property_flags(&property) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let opts = query::QueryOptions {
+                type_name,
+                filename_glob,
+                last,
+                days,
+                grep,
+                has_link,
+                properties,
+                json,
+                count,
+                path_only: paths_only,
+            };
+            if let Err(e) = query::query_output(&root, &cwd, &paths, opts) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+
+        cli::Command::Preset { name } => match name {
+            None => {
+                for (preset_name, _) in schema::BUILTIN_PRESETS {
+                    println!("{preset_name}");
+                }
+            }
+            Some(name) => {
+                let found = schema::BUILTIN_PRESETS
+                    .iter()
+                    .find(|(n, _)| *n == name.as_str());
+                match found {
+                    Some((_, content)) => print!("{content}"),
+                    None => {
+                        let available: Vec<&str> =
+                            schema::BUILTIN_PRESETS.iter().map(|(n, _)| *n).collect();
+                        eprintln!(
+                            "unknown preset '{name}'; available: {}",
+                            available.join(", ")
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
     }
 }

@@ -14,7 +14,7 @@ version: "1.0"
 
 ## Coverage
 
-- **Field types**: string, integer, date, bool, enum, list-of-enum
+- **Field types**: string, integer, float, date, bool, enum, list-of-enum
 - **Title modes**: from_filename, from_directory, from_date, fixed string
 - **Section features**: strict_sections, required, bullets (ordered/unordered), template, intro_text, managed_content
 - **Link features**: target_type, bidirectional, cross-project schema discovery

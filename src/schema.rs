@@ -37,11 +37,15 @@ fn presets_dir_under(config_home: &Path) -> Option<PathBuf> {
 }
 
 /// Built-in presets embedded at compile time from `presets/*.yaml`.
-const BUILTIN_PRESETS: &[(&str, &str)] = &[
+pub const BUILTIN_PRESETS: &[(&str, &str)] = &[
     ("agent", include_str!("../presets/agent.yaml")),
     ("agents", include_str!("../presets/agents.yaml")),
     ("command", include_str!("../presets/command.yaml")),
     ("journal", include_str!("../presets/journal.yaml")),
+    (
+        "journal-entry",
+        include_str!("../presets/journal-entry.yaml"),
+    ),
     ("readme", include_str!("../presets/readme.yaml")),
     ("skill", include_str!("../presets/skill.yaml")),
     ("roadmap", include_str!("../presets/roadmap.yaml")),
@@ -523,6 +527,7 @@ pub enum FieldType {
     Date,
     Datetime,
     Integer,
+    Float,
     Bool,
     Enum,
     Link,
@@ -1326,6 +1331,36 @@ structure:
             matcher.match_path(".claude/commands/test.md"),
             vec!["command"]
         );
+    }
+
+    // ── journal / journal-entry path discrimination ─────────────────────────
+
+    #[test]
+    fn test_journal_patterns_no_conflict() {
+        let mut schema = Schema::default();
+        let journal: TypeDef =
+            serde_yaml::from_str("paths:\n  - \"**/journal/????-??.md\"\n").unwrap();
+        let entry: TypeDef =
+            serde_yaml::from_str("paths:\n  - \"**/journal/????-??-??T??-??.md\"\n").unwrap();
+        schema.types.insert("journal".to_string(), journal);
+        schema.types.insert("journal-entry".to_string(), entry);
+
+        let matcher = schema.build_path_matcher().unwrap();
+
+        // Monthly file matches journal only
+        let m = matcher.match_path("journal/2026-04.md");
+        assert_eq!(m, vec!["journal"], "monthly: {m:?}");
+
+        // Entry file matches journal-entry only
+        let m = matcher.match_path("journal/2026-04-03T14-32.md");
+        assert_eq!(m, vec!["journal-entry"], "entry: {m:?}");
+
+        // Nested paths work too
+        let m = matcher.match_path("projects/foo/journal/2026-04-03T14-32.md");
+        assert_eq!(m, vec!["journal-entry"], "nested entry: {m:?}");
+
+        // Unrelated file matches neither
+        assert!(matcher.match_path("journal/notes.md").is_empty());
     }
 
     // ── presets_dir ───────────────────────────────────────────────────────────

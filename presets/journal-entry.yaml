@@ -1,0 +1,7 @@
+description: Single journal entry. Filename is the timestamp (YYYY-MM-DDTHH-MM.md).
+paths:
+  - "**/journal/????-??-??T??-??.md"
+
+structure:
+  title: none
+  strict_sections: false

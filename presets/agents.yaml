@@ -13,7 +13,7 @@ structure:
         template: |
           ## Related Documents
 
-          - **journal/** - Daily notes in `YYYY-MM.md` files. Log design discussions, investigations, and decisions with `## YYYY-MM-DD` headings.
+          - **journal/** - Log design discussions, investigations, and decisions. One entry per `YYYY-MM-DDTHH-MM.md` file.
           - **ROADMAP.md** - Future possibilities and explicit non-goals. Update when brainstorming; don't track completed work here.
           - **AGENTS.md** - How to work on the project: architecture, commands, lints. Keep concise.
           - **../knowledge/** - Personal knowledge base. Read `AGENTS.md` there for structure; schemas in `.typedown/`.

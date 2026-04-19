@@ -3,10 +3,7 @@ description: >-
   on-demand via the skill tool. The directory name must match the frontmatter
   name field.
 paths:
-  - "skills/*/SKILL.md"
-  - ".opencode/skills/*/SKILL.md"
-  - ".claude/skills/*/SKILL.md"
-  - ".agents/skills/*/SKILL.md"
+  - "**/skills/*/SKILL.md"
 
 fields:
   name:

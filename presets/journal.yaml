@@ -1,6 +1,6 @@
-description: Monthly journal file. H1 derived from filename; H2s are date entries sorted newest first.
+description: Monthly journal file (legacy). H1 derived from filename; H2s are date entries sorted newest first.
 paths:
-  - "**/journal/*.md"
+  - "**/journal/????-??.md"
 
 structure:
   title: from_date

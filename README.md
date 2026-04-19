@@ -33,7 +33,7 @@ This README complies with that schema. Run `td fmt` and typedown validates struc
 
 ## Features
 
-- **Frontmatter fields**: string, date, integer, bool, enum, link, list
+- **Frontmatter fields**: string, date, integer, float, bool, enum, link, list
 - **Bullet templates**: validate list items against patterns (like this section)
 - **Managed sections**: auto-generated content from templates
 - **Link validation**: with optional type constraints across documents

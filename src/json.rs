@@ -40,15 +40,13 @@ use std::{
 };
 
 use anyhow::Result;
-use serde::Serialize;
-use walkdir::WalkDir;
-
 use indexmap::IndexMap;
+use serde::Serialize;
 
 use crate::{
     ast::{inlines_to_string, Block, Document, Inline, ListItem},
     format::{
-        find_schema_for, is_ignored, is_markdown, load_all_schemas, resolve_type, FormatResult,
+        find_schema_for, is_markdown, load_all_schemas, resolve_type, walk, FormatResult,
         ResolvedType,
     },
     parse::serialize_blocks,
@@ -173,10 +171,7 @@ pub fn json_output(
                     process_file(target, root, &schemas, &matchers, pretty, &mut out)?;
                 }
             } else {
-                let walker = WalkDir::new(target)
-                    .into_iter()
-                    .filter_entry(|e| !is_ignored(e.file_name().to_str().unwrap_or("")));
-                for entry in walker.filter_map(|e| e.ok()) {
+                for entry in walk(target).filter_map(|e| e.ok()) {
                     let path = entry.path();
                     if is_markdown(path) {
                         process_file(path, root, &schemas, &matchers, pretty, &mut out)?;
@@ -233,10 +228,7 @@ fn expand_to_markdown_files(targets: &[PathBuf]) -> Vec<PathBuf> {
                 result.push(target.clone());
             }
         } else {
-            let walker = WalkDir::new(target)
-                .into_iter()
-                .filter_entry(|e| !is_ignored(e.file_name().to_str().unwrap_or("")));
-            for entry in walker.filter_map(|e| e.ok()) {
+            for entry in walk(target).filter_map(|e| e.ok()) {
                 let path = entry.path().to_path_buf();
                 if is_markdown(&path) {
                     result.push(path);
@@ -477,6 +469,20 @@ fn coerce_by_type(
                 .unwrap_or_else(|_| serde_json::Value::String(s.clone())),
             _ => yaml_to_json(value),
         },
+        FieldType::Float => match value {
+            serde_yaml::Value::Number(n) => n
+                .as_f64()
+                .and_then(serde_json::Number::from_f64)
+                .map(serde_json::Value::Number)
+                .unwrap_or_else(|| yaml_to_json(value)),
+            serde_yaml::Value::String(s) => s
+                .parse::<f64>()
+                .ok()
+                .and_then(serde_json::Number::from_f64)
+                .map(serde_json::Value::Number)
+                .unwrap_or_else(|| serde_json::Value::String(s.clone())),
+            _ => yaml_to_json(value),
+        },
         FieldType::Bool => match value {
             serde_yaml::Value::Bool(b) => serde_json::Value::Bool(*b),
             serde_yaml::Value::String(s) => match s.as_str() {
@@ -574,7 +580,12 @@ fn build_sections(
                 let section_blocks = &blocks[start..i];
                 // Look up property definitions for this section (H2 level only)
                 let props = struct_def
-                    .and_then(|sd| sd.sections.iter().find(|s| s.title == heading_text))
+                    .and_then(|sd| {
+                        sd.sections
+                            .iter()
+                            .find(|s| s.title == heading_text)
+                            .or_else(|| sd.sections.iter().find(|s| s.title == "*"))
+                    })
                     .and_then(|sd| sd.properties.as_ref());
                 result.push(make_section(
                     heading_text,
@@ -734,6 +745,9 @@ fn list_item_to_json_item(
 
 /// Parse a list item's sub-list as `Key: Value` pairs and coerce each value
 /// to the declared JSON type. Unknown keys are included as strings.
+/// When the same key appears more than once, values are collected into an
+/// array preserving order -- first occurrence stays as a scalar, second
+/// upgrades to `[first, second]`, third appends to `[first, second, third]`.
 fn extract_item_properties(
     item: &ListItem,
     properties_def: &IndexMap<String, FieldDef>,
@@ -751,12 +765,37 @@ fn extract_item_properties(
                     } else {
                         serde_json::Value::String(val_str.to_string())
                     };
-                    result.insert(key, json_val);
+                    merge_property_value(&mut result, key, json_val);
                 }
             }
         }
     }
     result
+}
+
+/// Insert a property value, aggregating into an array when the key already
+/// exists.  Prevents silent data loss when a markdown doc repeats the same
+/// sub-property key on a single list item (e.g. multiple `Placements:`
+/// lines).  First occurrence → scalar; second → `[first, second]`; subsequent
+/// occurrences push onto the array.
+fn merge_property_value(
+    result: &mut IndexMap<String, serde_json::Value>,
+    key: String,
+    value: serde_json::Value,
+) {
+    match result.get_mut(&key) {
+        None => {
+            result.insert(key, value);
+        }
+        Some(existing) => {
+            if let serde_json::Value::Array(arr) = existing {
+                arr.push(value);
+            } else {
+                let old = std::mem::replace(existing, serde_json::Value::Null);
+                *existing = serde_json::Value::Array(vec![old, value]);
+            }
+        }
+    }
 }
 
 /// Extract section-level properties from flat `Key: Value` list items.
@@ -787,7 +826,7 @@ fn extract_flat_section_properties(
             } else {
                 serde_json::Value::String(val_str.to_string())
             };
-            result.insert(key, json_val);
+            merge_property_value(&mut result, key, json_val);
         }
     }
 
@@ -1174,6 +1213,36 @@ mod tests {
     }
 
     #[test]
+    fn test_properties_float_coercion() {
+        let type_def = make_type_def_with_properties(
+            "        rating:\n          type: float\n        weight:\n          type: float\n",
+        );
+        let doc = mk("# T\n\n## Media\n\n- Item\n  - Rating: 4.5\n  - Weight: 7\n");
+        let jdoc = document_to_json(
+            &doc,
+            Path::new("test.md"),
+            None,
+            Some(&type_def),
+            Path::new(""),
+        );
+        let item = &jdoc.sections[0].items[0];
+        assert_eq!(
+            item.properties
+                .get("rating")
+                .and_then(|v| v.as_f64()),
+            Some(4.5),
+            "float property should coerce to number"
+        );
+        assert_eq!(
+            item.properties
+                .get("weight")
+                .and_then(|v| v.as_f64()),
+            Some(7.0),
+            "integer value should coerce to float"
+        );
+    }
+
+    #[test]
     fn test_properties_bool_coercion() {
         let type_def = make_type_def_with_properties("        hdr:\n          type: bool\n");
         // Document uses uppercase key
@@ -1244,6 +1313,120 @@ mod tests {
             jdoc.sections[0].items[1].properties.get("size"),
             Some(&serde_json::Value::Number(30.into()))
         );
+    }
+
+    #[test]
+    fn test_properties_duplicate_keys_become_array() {
+        // Regression: repeating the same sub-property key on a single list
+        // item used to be last-wins and silently dropped earlier values.
+        // Now duplicates are aggregated into an array.
+        let type_def = make_type_def_with_properties(
+            "        placements:\n          type: string\n        size:\n          type: integer\n",
+        );
+        let doc = mk(
+            "# T\n\n## Media\n\n- WEBDL-2160p\n  - Size: 26771362547\n  - Placements: snap-22000-1-media: video/foo.mp4\n  - Placements: media-scratch: video/foo.mp4\n",
+        );
+        let jdoc = document_to_json(
+            &doc,
+            Path::new("test.md"),
+            None,
+            Some(&type_def),
+            Path::new(""),
+        );
+        let item = &jdoc.sections[0].items[0];
+        assert_eq!(item.text, "WEBDL-2160p");
+        assert_eq!(
+            item.properties.get("size"),
+            Some(&serde_json::Value::Number(26771362547i64.into())),
+            "non-duplicated scalar should stay scalar"
+        );
+        let placements = item
+            .properties
+            .get("placements")
+            .expect("placements should be present");
+        let arr = placements
+            .as_array()
+            .expect("duplicate keys must be aggregated into an array");
+        assert_eq!(arr.len(), 2, "both Placements entries must be preserved");
+        assert_eq!(
+            arr[0].as_str(),
+            Some("snap-22000-1-media: video/foo.mp4"),
+            "first occurrence preserved in order"
+        );
+        assert_eq!(
+            arr[1].as_str(),
+            Some("media-scratch: video/foo.mp4"),
+            "second occurrence preserved in order"
+        );
+    }
+
+    #[test]
+    fn test_properties_triple_duplicate_keys_become_array() {
+        // Three entries → 3-element array (docs in the wild have up to 3).
+        let type_def =
+            make_type_def_with_properties("        placements:\n          type: string\n");
+        let doc = mk(
+            "# T\n\n## Media\n\n- 4K\n  - Placements: a: x\n  - Placements: b: y\n  - Placements: c: z\n",
+        );
+        let jdoc = document_to_json(
+            &doc,
+            Path::new("test.md"),
+            None,
+            Some(&type_def),
+            Path::new(""),
+        );
+        let arr = jdoc.sections[0].items[0]
+            .properties
+            .get("placements")
+            .and_then(|v| v.as_array())
+            .expect("placements should be an array");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0].as_str(), Some("a: x"));
+        assert_eq!(arr[1].as_str(), Some("b: y"));
+        assert_eq!(arr[2].as_str(), Some("c: z"));
+    }
+
+    #[test]
+    fn test_flat_section_properties_duplicate_keys_become_array() {
+        // Same aggregation policy for section-level flat properties.
+        let type_def = make_type_def_with_properties("        tag:\n          type: string\n");
+        let doc = mk("# T\n\n## Media\n\n- Tag: first\n- Tag: second\n");
+        let jdoc = document_to_json(
+            &doc,
+            Path::new("test.md"),
+            None,
+            Some(&type_def),
+            Path::new(""),
+        );
+        let sec = &jdoc.sections[0];
+        let arr = sec
+            .properties
+            .get("tag")
+            .and_then(|v| v.as_array())
+            .expect("duplicate tags must be aggregated into an array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].as_str(), Some("first"));
+        assert_eq!(arr[1].as_str(), Some("second"));
+    }
+
+    #[test]
+    fn test_properties_duplicate_unknown_keys_become_array() {
+        // Duplicates also aggregate for keys not declared in the schema.
+        let type_def = make_type_def_with_properties("        size:\n          type: integer\n");
+        let doc = mk("# T\n\n## Media\n\n- Bluray\n  - Extra: one\n  - Extra: two\n");
+        let jdoc = document_to_json(
+            &doc,
+            Path::new("test.md"),
+            None,
+            Some(&type_def),
+            Path::new(""),
+        );
+        let arr = jdoc.sections[0].items[0]
+            .properties
+            .get("extra")
+            .and_then(|v| v.as_array())
+            .expect("duplicate unknown keys should also aggregate");
+        assert_eq!(arr.len(), 2);
     }
 
     #[test]

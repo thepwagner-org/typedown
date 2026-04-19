@@ -2,15 +2,6 @@
 
 This document explores future possibilities for typedown. For current implementation and development guidelines, see [AGENTS.md](AGENTS.md).
 
-## LSP Enhancements
-
-The LSP server works for diagnostics. Possible next steps if opencode or other editors can use them:
-
-- Code actions from fixable diagnostics (`Fix::from_diagnostic` already exists)
-- `textDocument/formatting` via the existing format pipeline
-- Document symbols (H1/H2 headings as symbols)
-- Diagnostic severity differentiation (WARNING for size/backlink, HINT for cosmetic)
-
 ## Link Repair
 
 When a link is broken, try to fix it instead of just reporting it.

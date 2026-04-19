@@ -10,8 +10,8 @@ use std::{
 use rayon::prelude::*;
 
 use anyhow::{Context, Result};
+use ignore::WalkBuilder;
 use tracing::debug;
-use walkdir::WalkDir;
 
 use crate::{
     ast::Document,
@@ -52,7 +52,7 @@ pub struct FileError {
 
 /// Format (or check) all markdown files under `root`.
 ///
-/// - Walks the directory tree (skipping `node_modules` and `.git`).
+/// - Walks the directory tree (respecting `.gitignore` and `.ignore`; always skips `.git/`).
 /// - For each `.md` file, finds the nearest `.typedown/` schema dir (walking up to `root`).
 /// - Reads the `type` field from frontmatter to pick the schema type.
 /// - If no `type:` is present, tries path-pattern matching from `paths:` in schemas.
@@ -547,11 +547,7 @@ pub(crate) fn load_all_schemas(
         debug!(types = p.types.len(), "loaded presets");
     }
 
-    let walker = WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| !is_ignored(e.file_name().to_str().unwrap_or("")));
-
-    for entry in walker.filter_map(|e| e.ok()) {
+    for entry in walk(root).filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.file_name().and_then(|n| n.to_str()) == Some(SCHEMA_DIR) && path.is_dir() {
             if schemas.contains_key(path) {
@@ -671,11 +667,7 @@ fn preload_linked_docs(
     let mut linked: HashMap<PathBuf, LinkedDocInfo> = HashMap::new();
     let mut doc_cache: HashMap<PathBuf, (String, Document)> = HashMap::new();
 
-    let walker = WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| !is_ignored(e.file_name().to_str().unwrap_or("")));
-
-    for entry in walker.filter_map(|e| e.ok()) {
+    for entry in walk(root).filter_map(|e| e.ok()) {
         let path = entry.path();
         if !is_markdown(path) {
             continue;
@@ -1143,9 +1135,7 @@ pub(crate) fn find_project_root(start: &Path) -> Option<PathBuf> {
 /// emitted so that callers know to re-run without arguments for full coverage.
 fn resolve_file_args(root: &Path, explicit_paths: &[PathBuf]) -> Vec<PathBuf> {
     if explicit_paths.is_empty() {
-        return WalkDir::new(root)
-            .into_iter()
-            .filter_entry(|e| !is_ignored(e.file_name().to_str().unwrap_or("")))
+        return walk(root)
             .filter_map(|e| e.ok())
             .filter(|e| is_markdown(e.path()))
             .map(|e| e.path().to_path_buf())
@@ -1155,9 +1145,7 @@ fn resolve_file_args(root: &Path, explicit_paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for p in explicit_paths {
         if p.is_dir() {
-            let walked: Vec<PathBuf> = WalkDir::new(p)
-                .into_iter()
-                .filter_entry(|e| !is_ignored(e.file_name().to_str().unwrap_or("")))
+            let walked: Vec<PathBuf> = walk(p)
                 .filter_map(|e| e.ok())
                 .filter(|e| is_markdown(e.path()))
                 .map(|e| e.path().to_path_buf())
@@ -1182,8 +1170,19 @@ pub(crate) fn is_markdown(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("md")
 }
 
-pub(crate) fn is_ignored(name: &str) -> bool {
-    matches!(name, "node_modules" | ".git" | "target")
+/// Build a recursive directory walker that respects `.gitignore`, `.ignore`,
+/// `.git/info/exclude`, and the user's global gitignore. Always skips `.git/`
+/// directories. Hidden files/dirs (dotfiles) are NOT skipped — projects
+/// commonly keep markdown in `.github/`, `.claude/`, etc.
+///
+/// Works outside git repos: `.gitignore` / `.ignore` files are still read and
+/// applied relative to the directory they live in.
+pub(crate) fn walk(root: &Path) -> ignore::Walk {
+    WalkBuilder::new(root)
+        .hidden(false)
+        .require_git(false)
+        .filter_entry(|e| e.file_name() != ".git")
+        .build()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

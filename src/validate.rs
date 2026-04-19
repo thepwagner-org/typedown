@@ -546,6 +546,11 @@ fn check_typed_value(
                 return Some("must be an integer".to_string());
             }
         }
+        FieldType::Float => {
+            if !value.is_f64() && !value.is_i64() && !value.is_u64() && !null_ok {
+                return Some("must be a number".to_string());
+            }
+        }
         FieldType::Bool => {
             if !value.is_bool() && !null_ok {
                 return Some("must be a boolean".to_string());
@@ -1196,6 +1201,7 @@ fn validate_section_content(
             .sections
             .iter()
             .find(|s| &s.title == section_title)
+            .or_else(|| structure.sections.iter().find(|s| s.title == "*"))
         else {
             continue; // Unknown section; already reported in strict mode
         };
@@ -1392,6 +1398,11 @@ fn validate_property_str(value: &str, field_def: &FieldDef) -> Option<String> {
         FieldType::Integer => {
             if value.parse::<i64>().is_err() && value.parse::<u64>().is_err() {
                 return Some(format!("must be an integer (got '{value}')"));
+            }
+        }
+        FieldType::Float => {
+            if value.parse::<f64>().is_err() {
+                return Some(format!("must be a number (got '{value}')"));
             }
         }
         FieldType::Bool => match value.to_lowercase().as_str() {
@@ -2193,6 +2204,65 @@ mod tests {
             diags
                 .iter()
                 .any(|d| d.message().contains("must be an integer")),
+            "got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_float_field() {
+        let (schema, type_def) = make_schema(
+            "t",
+            "fields:\n  rating:\n    type: float\n    required: true\n",
+        );
+        let doc = parse("---\ntype: t\nrating: hello\n---\n");
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
+            None,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message().contains("must be a number")),
+            "got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_valid_float_field_accepts_integer() {
+        let (schema, type_def) = make_schema(
+            "t",
+            "fields:\n  rating:\n    type: float\n    required: true\n",
+        );
+        let doc = parse("---\ntype: t\nrating: 3\n---\n");
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
+            None,
+        );
+        assert!(
+            !diags.iter().any(|d| d.message().contains("must be")),
+            "got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_valid_float_field_accepts_decimal() {
+        let (schema, type_def) = make_schema(
+            "t",
+            "fields:\n  rating:\n    type: float\n    required: true\n",
+        );
+        let doc = parse("---\ntype: t\nrating: 3.14\n---\n");
+        let diags = validate(
+            &doc,
+            &type_def,
+            &make_ctx("t", empty_path(), &schema, empty_linked_docs()),
+            None,
+        );
+        assert!(
+            !diags.iter().any(|d| d.message().contains("must be")),
             "got: {diags:?}"
         );
     }
