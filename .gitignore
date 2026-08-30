@@ -3,6 +3,8 @@
 # Baseline ignores, injected by the monorepo mirror.
 /target/
 /node_modules/
+/vendor/*/target/
+/vendor/*/node_modules/
 /.direnv/
 /result
 /result-*

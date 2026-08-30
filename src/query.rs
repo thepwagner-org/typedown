@@ -390,10 +390,7 @@ fn resolve_path_match_type(
             }
             return None;
         }
-        match dir.parent() {
-            Some(p) => dir = p,
-            None => return None,
-        }
+        dir = dir.parent()?;
     }
 }
 
