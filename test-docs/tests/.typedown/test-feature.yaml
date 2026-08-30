@@ -1,26 +1,40 @@
+version: 2
 description: >-
   A typedown feature test document. Describes a feature while being validated
   by it. Each file exercises specific schema capabilities so a dumb agent
   breaking the file gets caught by the very feature it's editing.
 paths:
   - "features/*.md"
-
-fields:
-  status:
-    type: enum
-    required: true
-    values: [passing, failing, untested]
-  complexity:
-    type: integer
-    required: true
-  added:
-    type: date
-  breaking:
-    type: bool
-  tags:
-    type: list
-    item_type: enum
-    values: [frontmatter, structure, links, formatting, auto-fix, json]
+frontmatter:
+  type: object
+  properties:
+    status:
+      type: string
+      enum:
+        - passing
+        - failing
+        - untested
+    complexity:
+      type: integer
+    added:
+      type: string
+      format: date
+    breaking:
+      type: boolean
+    tags:
+      type: array
+      items:
+        type: string
+        enum:
+          - frontmatter
+          - structure
+          - links
+          - formatting
+          - auto-fix
+          - json
+  required:
+    - status
+    - complexity
 
 structure:
   title: from_filename

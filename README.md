@@ -8,6 +8,7 @@ Like TypeScript adds types to JavaScript, typedown adds types to markdown. Defin
 td fmt              # validate, fix, and format
 td check            # validate without writing (for CI)
 td lsp              # start language server (LSP over stdio)
+td schema           # print the json-schema that .typedown/*.yaml follow
 ```
 
 ## How It Works
@@ -15,7 +16,7 @@ td lsp              # start language server (LSP over stdio)
 Create a schema in `.typedown/readme.yaml`:
 
 ```yaml
-paths: ["**/README.md"]
+paths: ["README.md"]             # root README only — `**/` would claim nested ones too
 
 structure:
   title: from_directory          # H1 must match directory name
@@ -25,7 +26,7 @@ structure:
     - title: How It Works        # you are here
     - title: Features
       required: true
-      bullets: true
+      bullets: unordered
       template: "- **Text**: Text"
 ```
 
@@ -33,9 +34,9 @@ This README complies with that schema. Run `td fmt` and typedown validates struc
 
 ## Features
 
-- **Frontmatter fields**: string, date, integer, float, bool, enum, link, list
+- **Frontmatter as json-schema**: a schema's `frontmatter:` block is a literal json-schema, validated as written
 - **Bullet templates**: validate list items against patterns (like this section)
-- **Managed sections**: auto-generated content from templates
+- **Managed sections**: template-normalized content; entries you add by hand are kept
 - **Link validation**: with optional type constraints across documents
 - **Auto-fix**: `td fmt` fixes titles, section order, date entry sorting
 - **LSP and presets**: diagnostics on open/change, XDG presets for shared schemas

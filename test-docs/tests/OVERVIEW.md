@@ -16,7 +16,7 @@ version: "1.0"
 
 - **Field types**: string, integer, float, date, bool, enum, list-of-enum
 - **Title modes**: from_filename, from_directory, from_date, fixed string
-- **Section features**: strict_sections, required, bullets (ordered/unordered), template, intro_text, managed_content
+- **Section features**: strict_sections, required, bullets (ordered/unordered), template, managed_content
 - **Link features**: target_type, bidirectional, cross-project schema discovery
 - **Date headings**: oldest_first sort (chronological log)
 - **Intro section**: structure-level intro between H1 and first H2 (this file)

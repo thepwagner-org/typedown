@@ -1,0 +1,15 @@
+[package]
+name = "typedown-md"
+version = "0.0.0-dev"
+edition = "2021"
+description = "Lossless markdown parse/serialize round-trip with a frontmatter model"
+
+[dependencies]
+indexmap = { version = "2", features = ["serde"] }
+pulldown-cmark = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+[dev-dependencies]
+# The corpus tests walk every markdown file the checkout holds.
+walkdir = "2"

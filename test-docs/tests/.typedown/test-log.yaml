@@ -1,3 +1,4 @@
+version: 2
 description: >-
   A test activity log. Monthly file with one H2 per test run, sorted oldest
   first (chronological). Exercises from_date title mode, date_headings with

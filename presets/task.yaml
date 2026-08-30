@@ -1,0 +1,37 @@
+version: 2
+description: >-
+  An actionable unit of work, filed for someone to pick up later. Lives
+  in a project's tasks/ directory; whoever picks it up does the work and
+  deletes the file, so completion is signalled by the file's absence.
+  Filename stem is the task slug. Frontmatter may also carry a
+  `projects:` map (values `read`/`write`/`root`, exactly one `root`),
+  left untyped here — json-schema could describe the map, but the
+  exactly-one-`root` rule is the part that matters and it can't.
+paths:
+  - "**/tasks/*.md"
+frontmatter:
+  type: object
+  properties:
+    description:
+      type: string
+    model-class:
+      type: string
+      enum:
+        - haiku
+        - sonnet
+        - opus
+    parent:
+      type: string
+    recurring:
+      type: string
+    last-runs:
+      type: array
+      items:
+        type: string
+        format: date
+  required:
+    - description
+
+structure:
+  title: none
+  strict_sections: false

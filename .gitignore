@@ -1,3 +1,13 @@
-/target/
-/.direnv/
 /opencode.json
+
+# Baseline ignores, injected by the monorepo mirror.
+/target/
+/node_modules/
+/.direnv/
+/result
+/result-*
+*.swp
+*.swo
+*~
+*.snap.new
+.DS_Store

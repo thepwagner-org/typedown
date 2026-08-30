@@ -1,33 +1,39 @@
+version: 2
 description: >-
   An agent definition (OpenCode or Claude Code). The markdown body is the
   system prompt. Frontmatter configures model, tools, and permissions.
 paths:
   - "agents/*.md"
   - ".claude/agents/*.md"
-
-fields:
-  description:
-    type: string
-    required: true
-  mode:
-    type: enum
-    values: [primary, subagent, all]
-  model:
-    type: string
-  hidden:
-    type: bool
-  steps:
-    type: integer
-  color:
-    type: string
-  name:
-    type: string
-  tools:
-    type: string
-  skills:
-    type: string
-  allowed-tools:
-    type: string
+frontmatter:
+  type: object
+  properties:
+    description:
+      type: string
+    mode:
+      type: string
+      enum:
+        - primary
+        - subagent
+        - all
+    model:
+      type: string
+    hidden:
+      type: boolean
+    steps:
+      type: integer
+    color:
+      type: string
+    name:
+      type: string
+    tools:
+      type: string
+    skills:
+      type: string
+    allowed-tools:
+      type: string
+  required:
+    - description
 
 structure:
   title: none

@@ -1,4 +1,12 @@
-description: Agent instruction file (AGENTS.md). Size-limited; managed Related Documents section.
+version: 2
+description: >-
+  Agent instruction file (AGENTS.md / CLAUDE.md). Size-limited; managed
+  Related Documents section. The glob stays recursive on purpose —
+  per-directory instruction files are a real convention and want the size
+  warning too — but the Related Documents template names project-root paths
+  (README.md, GOALS.md, tasks/, journal/), so it carries `scope: root`.
+  A nested CLAUDE.md is still size-checked; it just never has a
+  root-shaped section invented for it.
 paths:
   - "**/AGENTS.md"
   - "**/CLAUDE.md"
@@ -10,13 +18,14 @@ structure:
   sections:
     - title: Related Documents
       managed_content:
+        scope: root
         template: |
           ## Related Documents
 
-          - **journal/** - Log design discussions, investigations, and decisions. One entry per `YYYY-MM-DDTHH-MM.md` file.
-          - **ROADMAP.md** - Future possibilities and explicit non-goals. Update when brainstorming; don't track completed work here.
-          - **AGENTS.md** - How to work on the project: architecture, commands, lints. Keep concise.
-          - **../knowledge/** - Personal knowledge base. Read `AGENTS.md` there for structure; schemas in `.typedown/`.
+          - **README.md** — what this project is and why.
+          - **GOALS.md** — goals and non-goals. Consult during planning.
+          - **tasks/** — actionable units. Deletion = done.
+          - **journal/** — narrative log. One entry per `YYYY-MM-DDTHH-MM.md` file. Append-only.
         migrate_from:
           - Journal
           - Roadmap

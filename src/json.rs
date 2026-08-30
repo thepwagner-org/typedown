@@ -44,7 +44,7 @@ use indexmap::IndexMap;
 use serde::Serialize;
 
 use crate::{
-    ast::{inlines_to_string, Block, Document, Inline, ListItem},
+    ast::{self, inlines_to_string, Block, Document, ListItem},
     format::{
         find_schema_for, is_markdown, load_all_schemas, resolve_type, walk, FormatResult,
         ResolvedType,
@@ -417,21 +417,16 @@ fn build_frontmatter_json(
         .frontmatter
         .as_ref()
         .and_then(|fm| fm.doc_type.as_deref());
-    match (fm_type, resolved_type) {
-        (Some(t), _) => {
+    if fm_type.is_none() {
+        if let Some(t) = resolved_type {
             map.insert("type".to_string(), serde_json::Value::String(t.to_string()));
         }
-        (None, Some(t)) => {
-            // path-matched file: inject the resolved type
-            map.insert("type".to_string(), serde_json::Value::String(t.to_string()));
-        }
-        (None, None) => {}
     }
 
     if let Some(fm) = &doc.frontmatter {
-        for (key, value) in &fm.fields {
-            let json_val = coerce_field_value(value, key, type_def);
-            map.insert(key.clone(), json_val);
+        for (key, value) in fm.iter() {
+            let json_val = coerce_field_value(&value, key, type_def);
+            map.insert(key.to_string(), json_val);
         }
     }
 
@@ -443,9 +438,73 @@ fn coerce_field_value(
     key: &str,
     type_def: Option<&TypeDef>,
 ) -> serde_json::Value {
-    match type_def.and_then(|td| td.fields.get(key)) {
-        Some(fd) => coerce_by_type(value, &fd.field_type, fd.item_type.as_ref()),
+    let Some(td) = type_def else {
+        return yaml_to_json(value);
+    };
+    match td.frontmatter_property(key) {
+        Some(prop) => coerce_by_json_schema(value, prop),
         None => yaml_to_json(value),
+    }
+}
+
+/// Coerce a frontmatter value using the type's json-schema for that property.
+///
+/// Mirrors [`coerce_by_type`]: YAML is untyped enough that `count: "3"` and
+/// `count: 3` both reach us, so the declared type decides. Only the scalar
+/// types json-schema names are handled; anything else passes through.
+fn coerce_by_json_schema(value: &serde_yaml::Value, prop: &serde_json::Value) -> serde_json::Value {
+    let declared = json_schema_types(prop);
+    let has = |t: &str| declared.contains(&t);
+
+    if has("integer") {
+        return coerce_by_type(value, &FieldType::Integer, None);
+    }
+    if has("number") {
+        return coerce_by_type(value, &FieldType::Float, None);
+    }
+    if has("boolean") {
+        return coerce_by_type(value, &FieldType::Bool, None);
+    }
+    if has("array") {
+        if let serde_yaml::Value::Sequence(seq) = value {
+            let items = prop.get("items");
+            return serde_json::Value::Array(
+                seq.iter()
+                    .map(|item| match items {
+                        Some(schema) => coerce_by_json_schema(item, schema),
+                        None => yaml_to_json(item),
+                    })
+                    .collect(),
+            );
+        }
+    }
+    if has("object") {
+        if let serde_yaml::Value::Mapping(map) = value {
+            let props = prop.get("properties");
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                let Some(k) = k.as_str() else {
+                    return yaml_to_json(value);
+                };
+                let coerced = match props.and_then(|p| p.get(k)) {
+                    Some(schema) => coerce_by_json_schema(v, schema),
+                    None => yaml_to_json(v),
+                };
+                out.insert(k.to_string(), coerced);
+            }
+            return serde_json::Value::Object(out);
+        }
+    }
+    yaml_to_json(value)
+}
+
+/// The `type` keyword of a json-schema as a list, handling both the string form
+/// (`type: integer`) and the union form (`type: [integer, "null"]`).
+fn json_schema_types(prop: &serde_json::Value) -> Vec<&str> {
+    match prop.get("type") {
+        Some(serde_json::Value::String(s)) => vec![s.as_str()],
+        Some(serde_json::Value::Array(items)) => items.iter().filter_map(|v| v.as_str()).collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -508,7 +567,7 @@ fn coerce_by_type(
     }
 }
 
-fn yaml_to_json(value: &serde_yaml::Value) -> serde_json::Value {
+pub(crate) fn yaml_to_json(value: &serde_yaml::Value) -> serde_json::Value {
     match value {
         serde_yaml::Value::Null => serde_json::Value::Null,
         serde_yaml::Value::Bool(b) => serde_json::Value::Bool(*b),
@@ -847,58 +906,13 @@ fn coerce_property_str(value: &str, field_def: &FieldDef) -> serde_json::Value {
 }
 
 fn extract_links(blocks: &[Block]) -> Vec<JsonLink> {
-    let mut links = Vec::new();
-    for block in blocks {
-        collect_block_links(block, &mut links);
-    }
-    links
-}
-
-fn collect_block_links(block: &Block, links: &mut Vec<JsonLink>) {
-    match block {
-        Block::Heading { content, .. } | Block::Paragraph { content, .. } => {
-            collect_inline_links(content, links);
-        }
-        Block::List { items, .. } => {
-            for item in items {
-                collect_inline_links(&item.content, links);
-                for child in &item.children {
-                    collect_block_links(child, links);
-                }
-            }
-        }
-        Block::BlockQuote { blocks, .. } => {
-            for b in blocks {
-                collect_block_links(b, links);
-            }
-        }
-        Block::Table { header, rows, .. } => {
-            for cell in header {
-                collect_inline_links(cell, links);
-            }
-            for row in rows {
-                for cell in row {
-                    collect_inline_links(cell, links);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_inline_links(inlines: &[Inline], links: &mut Vec<JsonLink>) {
-    for inline in inlines {
-        match inline {
-            Inline::Link { content, url } => links.push(JsonLink {
-                text: inlines_to_string(content),
-                url: url.clone(),
-            }),
-            Inline::Strong(inner) | Inline::Emphasis(inner) | Inline::Strikethrough(inner) => {
-                collect_inline_links(inner, links);
-            }
-            _ => {}
-        }
-    }
+    ast::links(blocks)
+        .into_iter()
+        .map(|link| JsonLink {
+            text: link.text,
+            url: link.url.to_string(),
+        })
+        .collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1083,6 +1097,17 @@ mod tests {
     }
 
     #[test]
+    fn test_image_links_extracted() {
+        // Images are links too: this walker used to skip them, so a section of
+        // screenshots came back with no links at all.
+        let doc = mk("# Title\n\n## Section\n\n![a shot](shot.png)\n");
+        let jdoc = document_to_json(&doc, Path::new("test.md"), None, None, Path::new(""));
+        assert_eq!(jdoc.sections[0].links.len(), 1);
+        assert_eq!(jdoc.sections[0].links[0].text, "a shot");
+        assert_eq!(jdoc.sections[0].links[0].url, "shot.png");
+    }
+
+    #[test]
     fn test_links_in_intro() {
         let doc = mk("# Title\n\nSee [README](README.md).\n\n## Section\n\nContent.\n");
         let jdoc = document_to_json(&doc, Path::new("test.md"), None, None, Path::new(""));
@@ -1177,6 +1202,73 @@ mod tests {
         );
     }
 
+    // ── v2 frontmatter coercion ───────────────────────────────────────────────
+
+    /// Build the frontmatter json for `md` under a v2 type declaring `props`.
+    fn v2_frontmatter(props: &str, md: &str) -> serde_json::Value {
+        let type_yaml = format!("version: 2\nfrontmatter:\n  type: object\n  properties:\n{props}");
+        let type_def: crate::schema::TypeDef =
+            serde_yaml::from_str(&type_yaml).expect("type yaml should parse");
+        let jdoc = document_to_json(
+            &mk(md),
+            Path::new("test.md"),
+            Some("thing"),
+            Some(&type_def),
+            Path::new(""),
+        );
+        jdoc.frontmatter
+    }
+
+    #[test]
+    fn test_v2_coerces_scalars_from_json_schema_types() {
+        // YAML hands us strings for quoted values; the json-schema decides.
+        let fm = v2_frontmatter(
+            "    count:\n      type: integer\n    ratio:\n      type: number\n    done:\n      type: boolean\n    name:\n      type: string\n",
+            "---\ntype: thing\ncount: \"42\"\nratio: \"1.5\"\ndone: \"yes\"\nname: 7\n---\n",
+        );
+        assert_eq!(fm["count"], serde_json::json!(42));
+        assert_eq!(fm["ratio"], serde_json::json!(1.5));
+        assert_eq!(fm["done"], serde_json::json!(true));
+        // `type: string` never coerces — a number stays a number, as in v1.
+        assert_eq!(fm["name"], serde_json::json!(7));
+    }
+
+    #[test]
+    fn test_v2_coerces_array_items() {
+        let fm = v2_frontmatter(
+            "    sizes:\n      type: array\n      items:\n        type: integer\n",
+            "---\ntype: thing\nsizes: [\"1\", \"2\", 3]\n---\n",
+        );
+        assert_eq!(fm["sizes"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn test_v2_coerces_nested_objects() {
+        let fm = v2_frontmatter(
+            "    meta:\n      type: object\n      properties:\n        pages:\n          type: integer\n",
+            "---\ntype: thing\nmeta:\n  pages: \"12\"\n  note: hi\n---\n",
+        );
+        assert_eq!(fm["meta"], serde_json::json!({"pages": 12, "note": "hi"}));
+    }
+
+    #[test]
+    fn test_v2_nullable_union_type_still_coerces() {
+        let fm = v2_frontmatter(
+            "    count:\n      type: [integer, \"null\"]\n",
+            "---\ntype: thing\ncount: \"9\"\n---\n",
+        );
+        assert_eq!(fm["count"], serde_json::json!(9));
+    }
+
+    #[test]
+    fn test_v2_undeclared_property_passes_through() {
+        let fm = v2_frontmatter(
+            "    count:\n      type: integer\n",
+            "---\ntype: thing\nextra: \"7\"\n---\n",
+        );
+        assert_eq!(fm["extra"], serde_json::json!("7"));
+    }
+
     // ── Properties tests ──────────────────────────────────────────────────────
 
     fn make_type_def_with_properties(props_yaml: &str) -> crate::schema::TypeDef {
@@ -1227,16 +1319,12 @@ mod tests {
         );
         let item = &jdoc.sections[0].items[0];
         assert_eq!(
-            item.properties
-                .get("rating")
-                .and_then(|v| v.as_f64()),
+            item.properties.get("rating").and_then(|v| v.as_f64()),
             Some(4.5),
             "float property should coerce to number"
         );
         assert_eq!(
-            item.properties
-                .get("weight")
-                .and_then(|v| v.as_f64()),
+            item.properties.get("weight").and_then(|v| v.as_f64()),
             Some(7.0),
             "integer value should coerce to float"
         );

@@ -1,0 +1,272 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/thepwagner-org/typedown/schema.json",
+  "title": "Typedown Schema",
+  "description": "Schema for typedown document type definitions (.typedown/*.yaml). The filename stem is the type name; documents declare 'type: <name>' in frontmatter or are matched by path patterns.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 2,
+      "description": "Schema format version. Must be 2: frontmatter is described by a literal json-schema under 'frontmatter:'. Version 1 (the 'fields:' map) was removed, and a schema that declares no version at all is a load error rather than an implicit 2 -- an unversioned file is a v1 leftover, and reading it as 2 would drop its 'fields:' block along with every requirement in it."
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of this document type. Documentation only — ignored by the engine."
+    },
+    "paths": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Glob patterns for files this schema applies to, relative to the .typedown/ parent directory. When a file matches and has no 'type:' frontmatter, this schema applies automatically. Supports *, **, ?. Example: '**/AGENTS.md', '.claude/commands/*.md'."
+    },
+    "frontmatter": {
+      "type": "object",
+      "description": "Literal json-schema for the document's frontmatter. The validated instance is the frontmatter object with 'type:' folded in, so 'type' can be constrained like any other property. Dates are ISO 8601 only: 'format: date' is YYYY-MM-DD, 'format: date-time' is RFC 3339. Property declaration order also sets the order 'td fmt' writes frontmatter keys in."
+    },
+    "structure": { "$ref": "#/$defs/structure_def" },
+    "correspondence": {
+      "type": "array",
+      "description": "Rules tying frontmatter data to body prose, in both directions. Each rule quantifies over a set ('each') and states what every member of it must have ('requires').",
+      "items": { "$ref": "#/$defs/correspondence_rule" }
+    }
+  },
+  "required": ["version"],
+  "$defs": {
+    "field_def": {
+      "type": "object",
+      "description": "Definition of a typed field in a section's 'properties:' map. These are prose 'Key: Value' pairs inside a list item, so they use typedown's own field types rather than json-schema, which frontmatter uses.",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["string", "date", "datetime", "integer", "float", "bool", "enum", "list"],
+          "description": "Property type. 'date' expects YYYY-MM-DD; 'datetime' expects YYYY-MM-DD HH:MM; 'float' accepts any number (integer or decimal); 'enum' requires 'values'; 'list' requires 'item_type'."
+        },
+        "required": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether this property must be present on every matched list item."
+        },
+        "values": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Allowed values. Required when type is 'enum'. Also required when type is 'list' and item_type is 'enum'."
+        },
+        "item_type": {
+          "type": "string",
+          "enum": ["string", "date", "datetime", "integer", "float", "bool", "enum"],
+          "description": "Element type for list properties. Required when type is 'list'. Nested lists are not supported."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "enum" } }, "required": ["type"] },
+          "then": { "required": ["values"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "list" } }, "required": ["type"] },
+          "then": { "required": ["item_type"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "list" }, "item_type": { "const": "enum" } },
+            "required": ["type", "item_type"]
+          },
+          "then": { "required": ["values"] }
+        }
+      ]
+    },
+    "structure_def": {
+      "type": "object",
+      "description": "Document structure rules.",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "H1 title validation mode. Named modes: 'none' (no validation, default), 'from_filename' (H1 must match filename stem), 'from_directory' (H1 must match parent directory name), 'from_date' (H1 derived from YYYY-MM filename, e.g. '2026-02.md' → 'February 2026'), 'required' (H1 must exist). Any other string is treated as fixed text — auto-created if missing."
+        },
+        "intro": {
+          "$ref": "#/$defs/section_def",
+          "description": "Content between H1 and the first H2. The section's 'title' field is unused here."
+        },
+        "sections": {
+          "type": "array",
+          "description": "H2 section definitions. When strict_sections is true (default), order is enforced and unlisted sections are rejected.",
+          "items": { "$ref": "#/$defs/section_def" }
+        },
+        "strict_sections": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true (default), sections must appear in schema-defined order and unlisted H2s are rejected. Set false to allow freeform sections."
+        },
+        "size_warning": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Emit a warning if the file exceeds this many bytes. Useful for documents that should stay concise (e.g. AGENTS.md)."
+        },
+        "date_headings": {
+          "$ref": "#/$defs/date_headings_def",
+          "description": "Date-based H2 heading validation. When set, every H2 must be a date (YYYY-MM-DD or YYYY-MM-DD HH:MM). Mutually exclusive with 'sections'."
+        }
+      }
+    },
+    "section_def": {
+      "type": "object",
+      "description": "Definition of a document section (H2 heading and its content).",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Exact H2 heading text. Must match the markdown heading exactly. Unused for 'intro'."
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of this section. Ignored by the engine; useful as LLM guidance."
+        },
+        "bullets": {
+          "type": "string",
+          "enum": ["ordered", "unordered"],
+          "description": "Restrict content to bullet lists only. 'ordered' requires numbered lists; 'unordered' requires dash lists. Default: omitted (paragraphs and any content allowed). A 'template' field implicitly enables unordered bullet mode."
+        },
+        "required": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether this section must be present in the document."
+        },
+        "template": {
+          "type": "string",
+          "description": "Expected format for list items, validated against each bullet. Recognises '[text](url)' as a link placeholder, '**bold**' as a bold placeholder, 'YYYY-MM-DD' as a date placeholder, and free text otherwise. A template that is only free text (e.g. '- Fact about the movie') matches every item and is reported as a no-op at schema load."
+        },
+        "links": { "$ref": "#/$defs/links_def" },
+        "managed_content": { "$ref": "#/$defs/managed_content" },
+        "properties": {
+          "type": "object",
+          "description": "Property map for top-level list items. Each item's sub-list is parsed as 'Key: Value' pairs and validated against these field definitions. Keys in the schema must be lowercase; document text may use any case (e.g. schema declares 'size', document can write 'Size: 42'). In 'td json' output, matched items gain a typed 'properties' object alongside the raw 'items' array. Delimiter is ': ' (colon-space).",
+          "additionalProperties": { "$ref": "#/$defs/field_def" }
+        }
+      }
+    },
+    "links_def": {
+      "type": "object",
+      "description": "Link constraints for a section.",
+      "additionalProperties": false,
+      "properties": {
+        "target_type": {
+          "type": "string",
+          "description": "Links in this section must point to documents of this schema type (the filename stem of a .typedown/*.yaml file)."
+        },
+        "bidirectional": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, linked documents must also link back to this document."
+        }
+      }
+    },
+    "managed_content": {
+      "type": "object",
+      "description": "Auto-managed section content. The validator checks the section against the template and 'td fmt' rewrites it. By default ('merge: upsert') the template's own entries are inserted and normalised while anything else the section holds is preserved.",
+      "required": ["template"],
+      "additionalProperties": false,
+      "properties": {
+        "template": {
+          "type": "string",
+          "description": "Markdown template the section must start with. Include the H2 heading line."
+        },
+        "merge": {
+          "type": "string",
+          "enum": ["upsert", "replace"],
+          "default": "upsert",
+          "description": "How the template meets content the section already has. 'upsert' (default) matches list items by identity (first link URL, else first bold run or code span, else plain text): the template's entries are rewritten in place, and entries it doesn't declare are kept and appended after them, as are blocks the template doesn't account for. 'replace' overwrites the whole section with the template, discarding everything else."
+        },
+        "scope": {
+          "type": "string",
+          "enum": ["any", "root"],
+          "default": "any",
+          "description": "Which of the type's documents the managed section applies to. 'any' (default) is every match. 'root' confines it to a document sitting directly in the schema root (the '.typedown/' parent), so a type with a recursive glob like '**/CLAUDE.md' can carry a root-shaped section without injecting it into nested copies, which keep whatever they authored."
+        },
+        "migrate_from": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Legacy section titles to automatically rename to this section's title."
+        }
+      }
+    },
+    "correspondence_rule": {
+      "type": "object",
+      "description": "One correspondence rule. Which 'requires' keys are meaningful depends on the selector, and a mismatched pairing is a schema load error rather than a silently ignored knob.",
+      "required": ["each", "requires"],
+      "additionalProperties": false,
+      "properties": {
+        "each": {
+          "type": "string",
+          "description": "The set the rule quantifies over. 'frontmatter.<array>[]' is every item of a frontmatter array and 'frontmatter.<field>' the one value of a scalar field (data → prose, or data → a link); 'subsections-under \"## Section\"' is every heading one level below that section (prose → data); 'links-in-section \"## Section\"' is every relative link in that section (prose → prose, or prose → data); 'docs-of-type <type> in-directory \".\"' is every document of that type that exists in the directory, whether or not this document mentions it (disk → prose), with 'under-directory' for that directory and everything below it.",
+          "pattern": "^(frontmatter\\.[A-Za-z0-9_.-]+(\\[\\](\\.[A-Za-z0-9_-]+)?)?|(subsections-under|links-in-section)\\s+\"#{1,6}\\s*\\S.*\"|docs-of-type\\s+[A-Za-z0-9_-]+\\s+(in|under)-directory\\s+\"[^\"/][^\"]*\")$"
+        },
+        "requires": { "$ref": "#/$defs/correspondence_requirement" },
+        "description": {
+          "type": "string",
+          "description": "Human-readable note. Ignored by the engine; useful as LLM guidance."
+        }
+      }
+    },
+    "correspondence_requirement": {
+      "type": "object",
+      "description": "What each member of the selected set must have.",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "subsection-under": {
+          "type": "string",
+          "description": "For 'each: frontmatter.<path>': the section the required subsection must live under, marker included (e.g. '## Files').",
+          "pattern": "^#{1,6}\\s*\\S"
+        },
+        "heading": {
+          "type": "string",
+          "description": "For 'each: frontmatter.<path>': the heading each item requires, with '{field}' placeholders interpolated from the item ('{.}' for a scalar item). Must be deeper than 'subsection-under' and must contain at least one placeholder.",
+          "pattern": "^#{1,6}\\s*\\S"
+        },
+        "frontmatter-item": {
+          "type": "string",
+          "description": "For 'each: subsections-under': the frontmatter path a subsection heading must match, e.g. 'files[].quality' or 'qualities[]' for a scalar array. For 'each: links-in-section': the path each link's target filename must appear in, e.g. 'species[]' or a scalar 'location'.",
+          "pattern": "^(frontmatter\\.)?[A-Za-z0-9_.-]+(\\[\\](\\.[A-Za-z0-9_-]+)?)?$"
+        },
+        "target_type": {
+          "type": "string",
+          "description": "For 'each: links-in-section', and for 'each: frontmatter.<path>' alongside 'link-in': links must point to documents of this schema type (the filename stem of a .typedown/*.yaml file)."
+        },
+        "backlink-in": {
+          "description": "For 'each: links-in-section': the target document must link back from one of these sections, marker included (e.g. '## Movies'). A single string or a list of them.",
+          "oneOf": [
+            { "type": "string", "pattern": "^#{1,6}\\s*\\S" },
+            {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "pattern": "^#{1,6}\\s*\\S" }
+            }
+          ]
+        },
+        "link-in": {
+          "type": "string",
+          "description": "For 'each: docs-of-type': the section that must carry a link to each of those documents, marker included (e.g. '## Seasons'). For 'each: frontmatter.<path>': the section that must carry a link whose target filename matches each value.",
+          "pattern": "^#{1,6}\\s*\\S"
+        }
+      }
+    },
+    "date_headings_def": {
+      "type": "object",
+      "description": "Configuration for date-based H2 headings (journals, changelogs, meeting notes).",
+      "additionalProperties": false,
+      "properties": {
+        "sort": {
+          "type": "string",
+          "enum": ["newest_first", "oldest_first"],
+          "default": "newest_first",
+          "description": "Sort order for date entries. 'newest_first' (default) is reverse chronological. 'oldest_first' is chronological (e.g. changelogs)."
+        }
+      }
+    }
+  }
+}

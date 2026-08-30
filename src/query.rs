@@ -25,7 +25,7 @@ use std::{
 };
 
 use crate::{
-    ast::{inlines_to_string, Block, Document, Inline, ListItem},
+    ast::{self, inlines_to_string, Block, Document, ListItem},
     format::{
         find_schema_for, is_markdown, load_all_schemas, resolve_type, walk, FormatResult,
         ResolvedType,
@@ -436,12 +436,9 @@ fn apply_content_filters(
 
     // --property k=v (frontmatter equality, stringified)
     for (k, v) in &opts.properties {
-        let fm_val = doc
-            .frontmatter
-            .as_ref()
-            .and_then(|fm| fm.fields.get(k.as_str()));
+        let fm_val = doc.frontmatter.as_ref().and_then(|fm| fm.get(k));
         let matches = match fm_val {
-            Some(yv) => yaml_value_eq(yv, v),
+            Some(yv) => yaml_value_eq(&yv, v),
             None => false,
         };
         if !matches {
@@ -460,18 +457,10 @@ fn apply_content_filters(
 
     // --has-link against link URLs.
     if let Some(pat) = &opts.has_link {
-        let mut found = false;
-        let mut urls = Vec::new();
-        for block in &doc.blocks {
-            collect_link_urls(block, &mut urls);
-        }
-        for url in urls {
-            if url.contains(pat.as_str()) {
-                found = true;
-                break;
-            }
-        }
-        if !found {
+        if !ast::links(&doc.blocks)
+            .iter()
+            .any(|link| link.url.contains(pat.as_str()))
+        {
             return false;
         }
     }
@@ -500,7 +489,7 @@ fn yaml_value_eq(yv: &serde_yaml::Value, raw: &str) -> bool {
 fn frontmatter_date(doc: &Document) -> Option<NaiveDate> {
     let fm = doc.frontmatter.as_ref()?;
     for key in ["date", "created", "published", "updated"] {
-        if let Some(serde_yaml::Value::String(s)) = fm.fields.get(key) {
+        if let Some(s) = fm.scalar_str(key) {
             let head = &s[..s.len().min(10)];
             if let Ok(d) = NaiveDate::parse_from_str(head, "%Y-%m-%d") {
                 return Some(d);
@@ -564,50 +553,6 @@ fn collect_list_item_text(item: &ListItem, out: &mut String) {
     }
 }
 
-fn collect_link_urls(block: &Block, out: &mut Vec<String>) {
-    match block {
-        Block::Heading { content, .. } | Block::Paragraph { content, .. } => {
-            collect_inline_urls(content, out);
-        }
-        Block::List { items, .. } => {
-            for item in items {
-                collect_inline_urls(&item.content, out);
-                for child in &item.children {
-                    collect_link_urls(child, out);
-                }
-            }
-        }
-        Block::BlockQuote { blocks, .. } => {
-            for b in blocks {
-                collect_link_urls(b, out);
-            }
-        }
-        Block::Table { header, rows, .. } => {
-            for cell in header {
-                collect_inline_urls(cell, out);
-            }
-            for row in rows {
-                for cell in row {
-                    collect_inline_urls(cell, out);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_inline_urls(inlines: &[Inline], out: &mut Vec<String>) {
-    for inline in inlines {
-        match inline {
-            Inline::Link { url, .. } | Inline::Image { url, .. } => out.push(url.clone()),
-            Inline::Strong(inner) | Inline::Emphasis(inner) | Inline::Strikethrough(inner) => {
-                collect_inline_urls(inner, out)
-            }
-            _ => {}
-        }
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -666,7 +611,7 @@ mod tests {
         let dir = make_tree(&[
             (
                 ".typedown/note.yaml",
-                "paths:\n  - notes/*.md\nfields: {}\n",
+                "version: 2\npaths:\n  - notes/*.md\n",
             ),
             ("notes/first.md", "# First\n"),
             ("other/skip.md", "# Skip\n"),
@@ -678,6 +623,50 @@ mod tests {
             .collect();
         assert_eq!(notes.len(), 1);
         assert!(notes[0].rel_path.ends_with("first.md"));
+    }
+
+    /// A candidate for the content-filter tests, which never touch the path.
+    fn bare_candidate() -> Candidate {
+        Candidate {
+            abs_path: PathBuf::from("n.md"),
+            rel_path: PathBuf::from("n.md"),
+            basename: "n.md".to_string(),
+            file_date: None,
+            path_match_type: None,
+        }
+    }
+
+    fn property_filter(doc: &Document, key: &str, value: &str) -> bool {
+        let opts = QueryOptions {
+            properties: vec![(key.to_string(), value.to_string())],
+            ..QueryOptions::default()
+        };
+        apply_content_filters(&opts, "", doc, None, &bare_candidate())
+    }
+
+    #[test]
+    fn property_filter_matches_the_type_key() {
+        // `type` lives in `doc_type`, not `fields` — reading it off `fields`
+        // made `--property type=X` match nothing at all.
+        let doc = parse("---\ntype: note\nname: n\n---\n# N\n");
+        assert!(property_filter(&doc, "type", "note"));
+        assert!(!property_filter(&doc, "type", "other"));
+        assert!(property_filter(&doc, "name", "n"));
+    }
+
+    #[test]
+    fn has_link_filter_sees_image_and_autolink_urls() {
+        let doc = parse("# N\n\n![shot](shot.png)\n\n<https://example.com/a>\n");
+        let matching = |pat: &str| {
+            let opts = QueryOptions {
+                has_link: Some(pat.to_string()),
+                ..QueryOptions::default()
+            };
+            apply_content_filters(&opts, "", &doc, None, &bare_candidate())
+        };
+        assert!(matching("shot.png"));
+        assert!(matching("example.com"));
+        assert!(!matching("absent.md"));
     }
 
     #[test]

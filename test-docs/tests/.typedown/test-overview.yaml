@@ -1,16 +1,19 @@
+version: 2
 description: >-
   The test-docs overview page. Exercises from_directory title mode (the parent
   directory is named "tests"), the structure-level intro section (content
   between H1 and the first H2), and link target_type without bidirectional.
 paths:
   - "OVERVIEW.md"
-
-fields:
-  maintained_by:
-    type: string
-    required: true
-  version:
-    type: string
+frontmatter:
+  type: object
+  properties:
+    maintained_by:
+      type: string
+    version:
+      type: string
+  required:
+    - maintained_by
 
 structure:
   title: from_directory

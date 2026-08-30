@@ -1,14 +1,18 @@
-mod ast;
 mod cli;
+mod correspondence;
 mod fix;
 mod format;
 mod git;
 mod json;
 mod lsp;
-mod parse;
 mod query;
 mod schema;
 mod validate;
+
+// The document layer lives in the `typedown-md` sibling crate. Re-binding it at
+// the crate root keeps every `crate::ast::…` / `crate::parse::…` path in this
+// crate working, and keeps the seam a one-line edit if a module moves back.
+use typedown_md::{ast, parse};
 
 use std::path::{Path, PathBuf};
 
@@ -79,9 +83,10 @@ fn main() {
             match format::check_dir(&root, &resolve_paths(&cwd, &paths)) {
                 Ok(errors) => {
                     for file_err in &errors {
+                        let rel = file_err.path.strip_prefix(&cwd).unwrap_or(&file_err.path);
                         for d in &file_err.diagnostics {
                             let line = d.line().map(|l| format!(":{l}")).unwrap_or_default();
-                            eprintln!("{}{}:  {}", file_err.path.display(), line, d.message());
+                            eprintln!("{}{}:  {}", rel.display(), line, d.message());
                         }
                     }
                     if !errors.is_empty() {
@@ -175,5 +180,13 @@ fn main() {
                 }
             }
         },
+
+        cli::Command::Skill => {
+            print!("{}", include_str!("schema-authoring.md"));
+        }
+
+        cli::Command::Schema => {
+            print!("{}", schema::META_SCHEMA);
+        }
     }
 }

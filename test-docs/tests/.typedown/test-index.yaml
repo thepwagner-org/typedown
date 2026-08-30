@@ -1,17 +1,21 @@
+version: 2
 description: >-
   The index page for the typedown test suite. Lists all feature test documents
   and explains how the suite works. Exercises fixed title, managed content,
-  intro_text, and link target_type validation.
+  and link target_type validation.
 paths:
   - "INDEX.md"
-
-fields:
-  edition:
-    type: integer
-    required: true
-  updated:
-    type: date
-    required: true
+frontmatter:
+  type: object
+  properties:
+    edition:
+      type: integer
+    updated:
+      type: string
+      format: date
+  required:
+    - edition
+    - updated
 
 structure:
   title: Test Index
@@ -33,4 +37,3 @@ structure:
           `td fmt` to auto-fix what it can.
     - title: Out of Scope
       required: true
-      intro_text: "Things this test suite intentionally does not cover:"

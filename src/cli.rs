@@ -43,6 +43,10 @@ pub enum Command {
         /// Preset name to display (omit to list all)
         name: Option<String>,
     },
+    /// Print the schema-authoring guide (for agents and humans designing .typedown/*.yaml)
+    Skill,
+    /// Print the json-schema that .typedown/*.yaml files are written against
+    Schema,
     /// Filter documents by type, filename, date, text, links, or frontmatter
     Query {
         /// Files or directories to scan (defaults to current directory)

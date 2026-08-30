@@ -1,11 +1,11 @@
-//! Git integration: walk the HEAD tree to build a set of all tracked file paths.
+//! Git integration: walk the HEAD tree to build the set of tracked paths.
 //!
 //! Used to validate links to files that live outside the typedown project walk
-//! scope (e.g. cross-project links like `../../meow/README.md`).
+//! scope (e.g. cross-project links like `../../sibling-project/README.md`).
 //!
 //! Validation stays pure — this module is called once by the orchestrator
-//! (`format.rs`) and the resulting `HashSet<PathBuf>` is passed in as data.
-//! No I/O happens inside `validate.rs`.
+//! (`format.rs`) and the resulting [`GitTree`] is passed in as data. No I/O
+//! happens inside `validate.rs`.
 
 use std::{
     collections::HashSet,
@@ -13,6 +13,20 @@ use std::{
 };
 
 use git2::Repository;
+
+/// The paths HEAD tracks, split into files and the directories holding them.
+///
+/// Both sets hold absolute paths. `dirs` exists because `files` alone cannot
+/// tell "this one file is missing" from "this whole subtree isn't in the
+/// checkout" — a distinction link validation needs when a link leaves the
+/// project. `dirs` always contains the repository root itself.
+#[derive(Debug, Default)]
+pub struct GitTree {
+    /// Every blob in HEAD.
+    pub files: HashSet<PathBuf>,
+    /// Every tree in HEAD, plus the repository root.
+    pub dirs: HashSet<PathBuf>,
+}
 
 /// Return the absolute path of the git working directory containing `root`.
 ///
@@ -26,27 +40,34 @@ pub fn git_repo_root(root: &Path) -> Option<PathBuf> {
 ///
 /// Returns `None` if `root` is not inside a git repository, or if HEAD has
 /// no commits yet (empty repo). Uses libgit2; no subprocess.
-pub fn list_git_paths(root: &Path) -> Option<HashSet<PathBuf>> {
+pub fn read_head_tree(root: &Path) -> Option<GitTree> {
     let repo = Repository::discover(root).ok()?;
     let repo_root = repo.workdir()?.to_path_buf();
     let head = repo.head().ok()?;
     let tree = head.peel_to_tree().ok()?;
 
-    let mut paths = HashSet::new();
+    let mut out = GitTree::default();
+    out.dirs.insert(repo_root.clone());
     tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
-        if entry.kind() == Some(git2::ObjectType::Blob) {
-            if let Some(name) = entry.name() {
-                let rel = if dir.is_empty() {
-                    name.to_string()
-                } else {
-                    format!("{dir}{name}")
-                };
-                paths.insert(repo_root.join(rel));
+        if let Some(name) = entry.name() {
+            let rel = if dir.is_empty() {
+                name.to_string()
+            } else {
+                format!("{dir}{name}")
+            };
+            match entry.kind() {
+                Some(git2::ObjectType::Blob) => {
+                    out.files.insert(repo_root.join(rel));
+                }
+                Some(git2::ObjectType::Tree) => {
+                    out.dirs.insert(repo_root.join(rel));
+                }
+                _ => {}
             }
         }
         git2::TreeWalkResult::Ok
     })
     .ok()?;
 
-    Some(paths)
+    Some(out)
 }

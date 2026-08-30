@@ -1,14 +1,19 @@
-description: Project README with required frontmatter and full link validation.
-paths:
-  - "**/README.md"
+version: 2
+description: >-
+  Project README — free-form project identity (what it does, why it
+  exists). Goals and non-goals live in GOALS.md; metadata (description,
+  created, status) lives in project.nix, not in frontmatter.
 
-fields:
-  created:
-    type: date
-    required: true
-  description:
-    type: string
-    required: true
+# Anchored at the schema root, not `**/README.md`: `title: from_directory`
+# renames the H1 after the containing directory, which is right for the
+# project's own README and destroys the authored title of any nested one.
+#
+# `from_directory` compares ignoring case, so `bridge/README.md` keeps
+# `# Bridge`. The directory name is a filesystem slug: it says which title
+# the H1 states, not how the author capitalised it.
+paths:
+  - "README.md"
 
 structure:
   title: from_directory
+  strict_sections: false

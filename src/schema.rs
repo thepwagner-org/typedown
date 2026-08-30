@@ -9,8 +9,14 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+use crate::correspondence::CorrespondenceRule;
+
 /// Schema directory name.
 pub const SCHEMA_DIR: &str = ".typedown";
+
+/// The json-schema that `.typedown/*.yaml` files conform to, baked into the
+/// binary. `td schema` prints it, so nothing needs `schema.json` on disk.
+pub const META_SCHEMA: &str = include_str!("schema.json");
 
 /// Resolve the XDG presets directory (`$XDG_CONFIG_HOME/typedown/presets/`).
 ///
@@ -41,6 +47,7 @@ pub const BUILTIN_PRESETS: &[(&str, &str)] = &[
     ("agent", include_str!("../presets/agent.yaml")),
     ("agents", include_str!("../presets/agents.yaml")),
     ("command", include_str!("../presets/command.yaml")),
+    ("goals", include_str!("../presets/goals.yaml")),
     ("journal", include_str!("../presets/journal.yaml")),
     (
         "journal-entry",
@@ -49,13 +56,27 @@ pub const BUILTIN_PRESETS: &[(&str, &str)] = &[
     ("readme", include_str!("../presets/readme.yaml")),
     ("skill", include_str!("../presets/skill.yaml")),
     ("roadmap", include_str!("../presets/roadmap.yaml")),
+    ("task", include_str!("../presets/task.yaml")),
 ];
 
-/// Load built-in presets, then overlay any XDG presets on top.
+/// Load built-in presets, then overlay the presets in `dir` on top.
 ///
-/// Built-in presets ship with the binary. XDG presets (`~/.config/typedown/presets/`)
-/// override built-ins by type name — a local `readme.yaml` replaces the built-in one.
-pub fn load_presets() -> Option<Schema> {
+/// Built-in presets ship with the binary. Overlay presets (in production,
+/// `~/.config/typedown/presets/`) override built-ins by type name — a local
+/// `readme.yaml` replaces the built-in one.
+///
+/// The overlay directory is a parameter rather than something this function
+/// resolves from `XDG_CONFIG_HOME`: that variable is process-global, and a test
+/// pointing it at its own temp dir would change which presets every other
+/// test's `check_dir` loads on a neighbouring thread.
+///
+/// The second return value is the overlay directory's load error, if it had
+/// one, so orchestration can report it.  A preset that fails to load is not a
+/// preset that does nothing: it is one whose type falls back to the built-in of
+/// the same name, or vanishes, and either way the project's documents are being
+/// judged by a schema nobody wrote.  Swallowing that is how a stale schema
+/// stays stale.
+pub(crate) fn load_presets_from(dir: Option<PathBuf>) -> (Option<Schema>, Option<anyhow::Error>) {
     let mut schema = Schema::default();
 
     // 1. Load built-ins
@@ -65,20 +86,25 @@ pub fn load_presets() -> Option<Schema> {
         }
     }
 
-    // 2. Overlay XDG presets (override by type name)
-    if let Some(dir) = presets_dir() {
-        if let Ok(xdg) = Schema::load(&dir) {
-            for (name, type_def) in xdg.types {
-                schema.types.insert(name, type_def);
+    // 2. Overlay the external presets (override by type name)
+    let mut preset_error = None;
+    if let Some(dir) = dir {
+        match Schema::load(&dir) {
+            Ok(xdg) => {
+                for (name, type_def) in xdg.types {
+                    schema.types.insert(name, type_def);
+                }
             }
+            Err(e) => preset_error = Some(e),
         }
     }
 
-    if schema.types.is_empty() {
+    let schema = if schema.types.is_empty() {
         None
     } else {
         Some(schema)
-    }
+    };
+    (schema, preset_error)
 }
 
 /// A schema: a collection of named type definitions loaded from a `.typedown/` dir.
@@ -204,32 +230,212 @@ impl PathMatcher {
     }
 }
 
+/// Schema format version.
+///
+/// Only `2` exists: frontmatter is described by a literal json-schema under
+/// `frontmatter:`.  Version 1 — the bespoke `fields:` map — was removed;
+/// see `MISSING_SCHEMA_VERSION` for what a schema that omits `version:` does.
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+
+/// The `version` a schema file that declares none deserializes to.
+///
+/// Zero is not a real version, so it can't collide with one an author wrote.
+/// [`TypeDef::validate`] turns it into a load error rather than guessing: an
+/// unversioned schema is a v1 leftover, and silently reading one as v2 would
+/// drop its whole `fields:` block along with every requirement in it.
+const MISSING_SCHEMA_VERSION: u32 = 0;
+
 /// Definition of a document type.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TypeDef {
+    /// Schema format version.  Must be `2`; absent is a load error.
+    #[serde(default)]
+    pub version: u32,
     /// Glob patterns for files this schema applies to (relative to project root).
     ///
     /// When a file matches a pattern and has no `type:` in frontmatter, this
     /// schema is used automatically.  Supports `*`, `**`, `?` via `globset`.
     #[serde(default)]
     pub paths: Vec<String>,
-    /// Frontmatter field definitions (order matters for serialization).
+    /// Tombstone for the removed v1 `fields:` map.
+    ///
+    /// Kept only so a leftover v1 schema fails loudly.  Without it serde would
+    /// ignore the unknown key and the type would validate no frontmatter at
+    /// all — the same file, quietly enforcing nothing.
+    #[serde(default, rename = "fields")]
+    legacy_fields: Option<serde_yaml::Value>,
+    /// Literal json-schema describing the document's frontmatter.
+    ///
+    /// The instance validated against it is the frontmatter object with `type:`
+    /// included, so the schema can constrain `type` like any other property.
     #[serde(default)]
-    pub fields: IndexMap<String, FieldDef>,
+    pub frontmatter: Option<FrontmatterSchema>,
     /// Document structure rules.
     #[serde(default)]
     pub structure: StructureDef,
+    /// Rules tying frontmatter data to body prose, in both directions.
+    #[serde(default)]
+    pub correspondence: Vec<CorrespondenceRule>,
+    /// Lazily compiled validator for [`Self::frontmatter`].
+    #[serde(skip)]
+    compiled: std::sync::OnceLock<CompiledSchema>,
+}
+
+/// A v2 type's literal json-schema for frontmatter.
+///
+/// Carries the declared order of `properties` alongside the schema itself:
+/// `serde_json::Value` sorts object keys, but `td fmt` writes frontmatter in
+/// schema order, and the author's YAML order is the intended one.
+#[derive(Debug, Clone)]
+pub struct FrontmatterSchema {
+    /// The json-schema, as written.
+    pub schema: serde_json::Value,
+    /// `properties` keys in declaration order.
+    pub property_order: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for FrontmatterSchema {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let yaml = serde_yaml::Value::deserialize(deserializer)?;
+        let property_order = yaml
+            .get("properties")
+            .and_then(serde_yaml::Value::as_mapping)
+            .map(|m| {
+                m.keys()
+                    .filter_map(|k| k.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let schema = serde_yaml::from_value(yaml).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            schema,
+            property_order,
+        })
+    }
+}
+
+/// A compiled json-schema validator, cheap to clone and `Debug`-opaque.
+#[derive(Clone)]
+pub struct CompiledSchema(std::sync::Arc<jsonschema::Validator>);
+
+impl std::fmt::Debug for CompiledSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CompiledSchema(..)")
+    }
+}
+
+impl std::ops::Deref for CompiledSchema {
+    type Target = jsonschema::Validator;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Compile a json-schema for frontmatter validation.
+///
+/// v2 dates are ISO 8601 only: `format: date` is `YYYY-MM-DD`, `format:
+/// date-time` is RFC 3339 (`2026-01-02T14:30:00Z`).  The loose spellings v1
+/// took (`2026/01/02`, `January 2, 2026`, `2026-01-02 14:30`) are deliberately
+/// not accepted — the crate's own format implementations are used as-is.
+///
+/// Format assertion is switched on: in draft 2020-12 `format` is annotation-only
+/// by default, which would silently accept anything.
+pub fn compile_frontmatter_schema(schema: &serde_json::Value) -> Result<CompiledSchema> {
+    let validator = jsonschema::options()
+        .should_validate_formats(true)
+        .build(schema)
+        .map_err(|e| anyhow::anyhow!("invalid json-schema in 'frontmatter': {e}"))?;
+    Ok(CompiledSchema(std::sync::Arc::new(validator)))
 }
 
 impl TypeDef {
     /// Validate that the type definition is internally consistent.
     pub fn validate(&self, type_name: &str) -> Result<()> {
-        for (field_name, field_def) in &self.fields {
-            field_def
-                .validate(field_name)
-                .with_context(|| format!("in type '{type_name}'"))?;
+        match self.version {
+            CURRENT_SCHEMA_VERSION => {}
+            MISSING_SCHEMA_VERSION => anyhow::bail!(
+                "type '{type_name}': missing 'version: {CURRENT_SCHEMA_VERSION}' — every schema must declare its version"
+            ),
+            1 => anyhow::bail!(
+                "type '{type_name}': schema version 1 ('fields:') is no longer supported — describe frontmatter with the json-schema under 'frontmatter:' and declare 'version: {CURRENT_SCHEMA_VERSION}'"
+            ),
+            other => anyhow::bail!(
+                "type '{type_name}': unsupported schema version {other} (supported: {CURRENT_SCHEMA_VERSION})"
+            ),
+        }
+
+        if self.legacy_fields.is_some() {
+            anyhow::bail!(
+                "type '{type_name}': 'fields:' is the removed version 1 spelling — describe frontmatter with the json-schema under 'frontmatter:'"
+            );
+        }
+
+        self.frontmatter_validator()
+            .with_context(|| format!("in type '{type_name}'"))?;
+
+        for section in self.structure.intro.iter().chain(&self.structure.sections) {
+            for (field_name, field_def) in section.properties.iter().flatten() {
+                field_def.validate(field_name).with_context(|| {
+                    format!("in type '{type_name}', section '{}'", section.title)
+                })?;
+            }
+        }
+
+        for (idx, rule) in self.correspondence.iter().enumerate() {
+            rule.validate()
+                .with_context(|| format!("in type '{type_name}', correspondence rule {idx}"))?;
         }
         Ok(())
+    }
+
+    /// The compiled frontmatter validator, or `None` without a `frontmatter:`.
+    ///
+    /// Compiled once and memoized; returns `Err` if the json-schema is invalid.
+    pub fn frontmatter_validator(&self) -> Result<Option<&CompiledSchema>> {
+        let Some(schema) = &self.frontmatter else {
+            return Ok(None);
+        };
+        if self.compiled.get().is_none() {
+            let _ = self
+                .compiled
+                .set(compile_frontmatter_schema(&schema.schema)?);
+        }
+        Ok(self.compiled.get())
+    }
+
+    /// The json-schema for one frontmatter property, if declared under
+    /// `frontmatter.properties`. Used by `td json` for type coercion.
+    pub fn frontmatter_property(&self, key: &str) -> Option<&serde_json::Value> {
+        self.frontmatter
+            .as_ref()?
+            .schema
+            .get("properties")?
+            .get(key)
+            .filter(|v| !v.is_null())
+    }
+
+    /// Frontmatter keys in schema-declared order, for `td fmt` serialization.
+    pub fn frontmatter_field_order(&self) -> Vec<String> {
+        self.frontmatter
+            .as_ref()
+            .map(|fm| fm.property_order.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether a document of this type must carry frontmatter at all.
+    ///
+    /// `type` doesn't count: path-matched files get their type from their
+    /// location, so requiring it never forces a frontmatter block.
+    pub fn has_required_frontmatter(&self) -> bool {
+        self.frontmatter.as_ref().is_some_and(|fm| {
+            fm.schema
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|req| req.iter().any(|v| v.as_str() != Some("type")))
+        })
     }
 }
 
@@ -286,9 +492,10 @@ impl Default for StructureDef {
 /// Deserialized from a YAML string:
 /// - `"none"` → no validation
 /// - `"from_filename"` → H1 must match the filename (without `.md`)
-/// - `"from_directory"` → H1 must match the immediate parent directory name
-/// - `"from_project"` → H1 must match the project name or frontmatter `name`
-/// - `"from_date"` → H1 is derived from the filename parsed as `YYYY-MM` (e.g. `"February 2026"`)
+/// - `"from_directory"` → H1 must match the immediate parent directory name,
+///   compared ignoring ASCII case
+/// - `"from_date"` → H1 is derived from the filename parsed as `YYYY-MM` or
+///   `YYYY-MM-DD` (e.g. `"February 2026"`, `"April 14, 2026"`)
 /// - `"required"` → H1 must exist (unfixable if missing)
 /// - anything else → `Fixed("…")`: H1 auto-created with that text if missing
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -296,11 +503,13 @@ pub enum TitleMode {
     #[default]
     None,
     FromFilename,
-    /// H1 must match the name of the file's immediate parent directory.
+    /// H1 must match the name of the file's immediate parent directory,
+    /// ignoring ASCII case.
     ///
-    /// `typedown/README.md` → `# typedown`.
+    /// `typedown/README.md` → `# typedown`; `bridge/README.md` keeps
+    /// `# Bridge`. Directory names are filesystem slugs, so the directory
+    /// constrains *which* title the H1 states, not how it is capitalised.
     FromDirectory,
-    FromProject,
     /// Derive H1 from the filename parsed as a `YYYY-MM` date.
     ///
     /// `2026-02.md` → `# February 2026`.  Also implies that each
@@ -320,7 +529,6 @@ impl<'de> Deserialize<'de> for TitleMode {
             "none" => TitleMode::None,
             "from_filename" => TitleMode::FromFilename,
             "from_directory" => TitleMode::FromDirectory,
-            "from_project" => TitleMode::FromProject,
             "from_date" => TitleMode::FromDate,
             "required" => TitleMode::RequiredAny,
             other => TitleMode::Fixed(other.to_string()),
@@ -352,57 +560,14 @@ pub enum HeadingSort {
 
 /// Bullet-list mode for a section.
 ///
-/// Deserialized from YAML: `any`, `ordered`, `unordered`, or `true` (→ `Any`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Deserialized from YAML: `ordered` or `unordered`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BulletMode {
-    /// Any list type (ordered or unordered).
-    Any,
     /// Only ordered (numbered) lists.
     Ordered,
     /// Only unordered (dash/bullet) lists.
     Unordered,
-}
-
-impl<'de> Deserialize<'de> for BulletMode {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de;
-
-        struct BulletModeVisitor;
-
-        impl<'de> de::Visitor<'de> for BulletModeVisitor {
-            type Value = BulletMode;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("\"any\", \"ordered\", \"unordered\", or true")
-            }
-
-            fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
-                if v {
-                    Ok(BulletMode::Any)
-                } else {
-                    Err(E::custom(
-                        "bullets: false is not valid; omit the field instead",
-                    ))
-                }
-            }
-
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                match v {
-                    "any" => Ok(BulletMode::Any),
-                    "ordered" => Ok(BulletMode::Ordered),
-                    "unordered" => Ok(BulletMode::Unordered),
-                    other => Err(E::custom(format!(
-                        "unknown bullet mode '{other}'; expected any, ordered, or unordered"
-                    ))),
-                }
-            }
-        }
-
-        deserializer.deserialize_any(BulletModeVisitor)
-    }
 }
 
 /// Definition of a document section.
@@ -419,8 +584,7 @@ pub struct SectionDef {
     pub description: Option<String>,
     /// Restrict content to bullet lists only (default: `None` → any content allowed).
     ///
-    /// `any` — any list type; `ordered` — numbered lists only; `unordered` — dash lists only.
-    /// `true` is accepted as shorthand for `any`.
+    /// `ordered` — numbered lists only; `unordered` — dash lists only.
     #[serde(default)]
     pub bullets: Option<BulletMode>,
     /// Whether this section is required.
@@ -435,9 +599,6 @@ pub struct SectionDef {
     /// Auto-managed section content (template + legacy migration).
     #[serde(default)]
     pub managed_content: Option<ManagedContent>,
-    /// Required intro paragraph prefix; auto-inserted if missing.
-    #[serde(default)]
-    pub intro_text: Option<String>,
     /// Property map for top-level list items: each item's sub-items are parsed
     /// as `Key: Value` pairs, validated against these field definitions, and
     /// extracted into a `properties` object in `td json` output.
@@ -482,7 +643,12 @@ pub struct LinksDef {
     pub bidirectional: bool,
 }
 
-/// Typed frontmatter field definition.
+/// Typed field definition for a section's `properties:` map.
+///
+/// These are the one place typedown's own field types survive: a section's
+/// `properties:` describes `Key: Value` pairs inside a list item, which is
+/// prose rather than frontmatter, so json-schema has no instance to bind to.
+/// Frontmatter itself is json-schema — see `TypeDef::frontmatter`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FieldDef {
     #[serde(rename = "type")]
@@ -500,18 +666,13 @@ pub struct FieldDef {
 impl FieldDef {
     /// Validate that the field definition is internally consistent.
     pub fn validate(&self, field_name: &str) -> Result<()> {
+        let no_values = self.values.as_ref().is_none_or(|v| v.is_empty());
         match self.field_type {
-            FieldType::Enum => {
-                if self.values.as_ref().is_none_or(|v| v.is_empty()) {
-                    anyhow::bail!("field '{field_name}': enum type requires non-empty 'values'");
-                }
+            FieldType::Enum if no_values => {
+                anyhow::bail!("field '{field_name}': enum type requires non-empty 'values'")
             }
-            FieldType::List => {
-                if self.item_type == Some(FieldType::Enum)
-                    && self.values.as_ref().is_none_or(|v| v.is_empty())
-                {
-                    anyhow::bail!("field '{field_name}': list of enum requires non-empty 'values'");
-                }
+            FieldType::List if self.item_type == Some(FieldType::Enum) && no_values => {
+                anyhow::bail!("field '{field_name}': list of enum requires non-empty 'values'")
             }
             _ => {}
         }
@@ -519,7 +680,7 @@ impl FieldDef {
     }
 }
 
-/// Frontmatter field types.
+/// Field types for a section's `properties:` map.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldType {
@@ -530,22 +691,67 @@ pub enum FieldType {
     Float,
     Bool,
     Enum,
-    Link,
     List,
 }
 
 /// Auto-managed section content.
 ///
-/// When set, the validator checks the section matches the template and
-/// auto-fixes it on `td fmt`. Custom content appended after the template
-/// is preserved.
+/// When set, the validator checks the section against the template and
+/// auto-fixes it on `td fmt`. How the template meets content the document
+/// already has is decided by [`MergeMode`].
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ManagedContent {
     /// Markdown template the section must match.
     pub template: String,
+    /// How the template combines with content the document already has
+    /// (default: [`MergeMode::Upsert`]).
+    #[serde(default)]
+    pub merge: MergeMode,
+    /// Which of the type's documents the managed section applies to
+    /// (default: [`ManagedScope::Any`]).
+    #[serde(default)]
+    pub scope: ManagedScope,
     /// Legacy section titles to migrate away from.
     #[serde(default)]
     pub migrate_from: Vec<String>,
+}
+
+/// Which documents of a type a `managed_content` section applies to.
+///
+/// Lets a type keep a recursive `paths:` glob while confining a
+/// root-shaped managed section to the project's own copy of the document.
+/// `agents.yaml` is the motivating case: `**/CLAUDE.md` is deliberate
+/// (per-directory instruction files are a real convention and want the
+/// size warning), but its `Related Documents` template names `README.md`,
+/// `GOALS.md`, `tasks/` and `journal/` — paths that only exist at the
+/// project root.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ManagedScope {
+    /// Every document the type matches (default).
+    #[default]
+    Any,
+    /// Only a document sitting directly in the schema root (the
+    /// `.typedown/` parent). Nested matches keep whatever they authored;
+    /// the section is neither injected nor rewritten there.
+    Root,
+}
+
+/// How a `managed_content` template combines with a section's existing content.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeMode {
+    /// Insert and normalise the template's own entries, keep everything else
+    /// (default).
+    ///
+    /// List items are matched by identity rather than position, so the
+    /// template rewrites the entries it declares and leaves entries it has
+    /// never heard of alone — they are appended after the templated ones.
+    #[default]
+    Upsert,
+    /// Overwrite the section with the template, discarding anything else it
+    /// contained.
+    Replace,
 }
 
 // ── template matching ─────────────────────────────────────────────────────────
@@ -563,6 +769,67 @@ pub enum TemplateSegment {
     Date,
     /// Free text (matches any characters).
     Text,
+}
+
+/// A `template:` that constrains nothing, found at schema load time.
+///
+/// Once the list marker is stripped, the template compiles to free-text
+/// wildcards only, so `matches_template` accepts every list item.  The author
+/// almost certainly meant to describe a format, not to write a no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VacuousTemplate {
+    /// Type name — the `.typedown/*.yaml` file stem.
+    pub type_name: String,
+    /// Section title, or `"intro"` for the intro section.
+    pub section: String,
+    /// The template as written.
+    pub template: String,
+}
+
+/// Whether `segments` match any list item at all.
+///
+/// The leading list marker (`- `) is expected on both the template and the item
+/// text, so it carries no information; anything left must include at least one
+/// segment that isn't a free-text wildcard.
+fn is_vacuous_template(segments: &[TemplateSegment]) -> bool {
+    let body = match segments.first() {
+        Some(TemplateSegment::Literal(lit)) if matches!(lit.trim_end(), "" | "-" | "*" | "+") => {
+            &segments[1..]
+        }
+        _ => segments,
+    };
+    !body.is_empty() && body.iter().all(|s| *s == TemplateSegment::Text)
+}
+
+impl Schema {
+    /// Section templates across all types that validate anything at all.
+    ///
+    /// Pure: the caller turns these into diagnostics and decides where to
+    /// report them.
+    pub fn vacuous_templates(&self) -> Vec<VacuousTemplate> {
+        let mut out = Vec::new();
+        for (type_name, type_def) in &self.types {
+            let intro = type_def.structure.intro.iter().map(|s| ("intro", s));
+            let sections = type_def
+                .structure
+                .sections
+                .iter()
+                .map(|s| (s.title.as_str(), s));
+            for (section, section_def) in intro.chain(sections) {
+                let Some(template) = &section_def.template else {
+                    continue;
+                };
+                if is_vacuous_template(&parse_template(template)) {
+                    out.push(VacuousTemplate {
+                        type_name: type_name.clone(),
+                        section: section.to_string(),
+                        template: template.clone(),
+                    });
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Parse a template string into segments for [`matches_template`].
@@ -756,108 +1023,453 @@ mod tests {
     #[test]
     fn test_parse_basic_type() {
         let yaml = r#"
+version: 2
 description: A recipe document
-fields:
-  servings:
-    type: integer
-    required: true
-  cuisine:
-    type: enum
-    values: [italian, mexican, japanese]
-  source:
-    type: link
+frontmatter:
+  type: object
+  properties:
+    servings:
+      type: integer
+    cuisine:
+      type: string
+      enum: [italian, mexican, japanese]
+    source:
+      type: string
+  required: [servings]
 "#;
         let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(td.fields.len(), 3);
-        assert_eq!(td.fields["servings"].field_type, FieldType::Integer);
-        assert!(td.fields["servings"].required);
-        assert_eq!(td.fields["cuisine"].field_type, FieldType::Enum);
-        assert_eq!(td.fields["source"].field_type, FieldType::Link);
+        td.validate("recipe").unwrap();
+        assert_eq!(
+            td.frontmatter_field_order(),
+            ["servings", "cuisine", "source"]
+        );
+        assert!(td.has_required_frontmatter());
     }
 
+    // ── Section `properties:` field defs ──────────────────────────────────────
+
     #[test]
-    fn test_field_order_preserved() {
+    fn test_section_property_order_preserved() {
         let yaml = r#"
-fields:
-  zebra:
-    type: string
-  alpha:
-    type: string
-  middle:
-    type: string
+version: 2
+structure:
+  sections:
+    - title: Components
+      properties:
+        zebra:
+          type: string
+        alpha:
+          type: string
+        middle:
+          type: string
 "#;
         let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
-        let keys: Vec<&str> = td.fields.keys().map(|s| s.as_str()).collect();
+        let props = td.structure.sections[0].properties.as_ref().unwrap();
+        let keys: Vec<&str> = props.keys().map(|s| s.as_str()).collect();
         assert_eq!(keys, ["zebra", "alpha", "middle"]);
     }
 
     #[test]
-    fn test_all_field_types() {
+    fn test_all_property_field_types() {
         let yaml = r#"
-fields:
-  a: { type: string }
-  b: { type: date }
-  c: { type: datetime }
-  d: { type: integer }
-  e: { type: bool }
-  f: { type: enum, values: [x] }
-  g: { type: link }
-  h: { type: list, item_type: string }
+version: 2
+structure:
+  sections:
+    - title: Parts
+      properties:
+        a: { type: string }
+        b: { type: date }
+        c: { type: datetime }
+        d: { type: integer }
+        e: { type: bool }
+        f: { type: enum, values: [x] }
+        g: { type: float }
+        h: { type: list, item_type: string }
 "#;
         let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(td.fields["a"].field_type, FieldType::String);
-        assert_eq!(td.fields["b"].field_type, FieldType::Date);
-        assert_eq!(td.fields["c"].field_type, FieldType::Datetime);
-        assert_eq!(td.fields["d"].field_type, FieldType::Integer);
-        assert_eq!(td.fields["e"].field_type, FieldType::Bool);
-        assert_eq!(td.fields["f"].field_type, FieldType::Enum);
-        assert_eq!(td.fields["g"].field_type, FieldType::Link);
-        assert_eq!(td.fields["h"].field_type, FieldType::List);
-        assert_eq!(td.fields["h"].item_type, Some(FieldType::String));
+        let props = td.structure.sections[0].properties.as_ref().unwrap();
+        assert_eq!(props["a"].field_type, FieldType::String);
+        assert_eq!(props["b"].field_type, FieldType::Date);
+        assert_eq!(props["c"].field_type, FieldType::Datetime);
+        assert_eq!(props["d"].field_type, FieldType::Integer);
+        assert_eq!(props["e"].field_type, FieldType::Bool);
+        assert_eq!(props["f"].field_type, FieldType::Enum);
+        assert_eq!(props["g"].field_type, FieldType::Float);
+        assert_eq!(props["h"].field_type, FieldType::List);
+        assert_eq!(props["h"].item_type, Some(FieldType::String));
+    }
+
+    /// A section's `properties:` are checked for internal consistency the same
+    /// way frontmatter fields once were -- `enum` still needs `values`.
+    #[test]
+    fn test_section_property_enum_without_values_rejected() {
+        let yaml = "version: 2
+structure:
+  sections:
+    - title: Parts
+      properties:
+        category:
+          type: enum
+";
+        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
+        let err = td.validate("hardware").unwrap_err().to_string();
+        assert!(err.contains("in type 'hardware', section 'Parts'"), "{err}");
+    }
+
+    #[test]
+    fn test_intro_property_enum_without_values_rejected() {
+        let yaml = "version: 2
+structure:
+  intro:
+    properties:
+      category:
+        type: enum
+";
+        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
+        assert!(td.validate("hardware").is_err());
+    }
+
+    // ── v2 schemas ────────────────────────────────────────────────────────────
+
+    /// An unversioned schema is a v1 leftover.  Reading it as v2 would drop
+    /// its `fields:` block and quietly enforce nothing, so it is a load error.
+    #[test]
+    fn test_missing_version_is_an_error() {
+        let td: TypeDef = serde_yaml::from_str("description: a note\n").unwrap();
+        let err = td.validate("note").unwrap_err().to_string();
+        assert!(err.contains("missing 'version: 2'"), "{err}");
+    }
+
+    #[test]
+    fn test_version_1_is_an_error() {
+        let td: TypeDef =
+            serde_yaml::from_str("version: 1\nfields:\n  name:\n    type: string\n").unwrap();
+        let err = td.validate("note").unwrap_err().to_string();
+        assert!(
+            err.contains("version 1 ('fields:') is no longer supported"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_v2_frontmatter_parses_as_json_schema() {
+        let yaml = r#"
+version: 2
+frontmatter:
+  type: object
+  properties:
+    ticker:
+      type: string
+    weight:
+      type: integer
+  required: [ticker]
+"#;
+        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(td.version, 2);
+        td.validate("security").unwrap();
+        let fm = td.frontmatter.as_ref().unwrap();
+        assert_eq!(fm.schema["properties"]["weight"]["type"], "integer");
+        assert_eq!(fm.schema["required"][0], "ticker");
+        assert!(td.frontmatter_validator().unwrap().is_some());
+    }
+
+    #[test]
+    fn test_v2_property_order_is_the_authors_order() {
+        // serde_json sorts object keys; `td fmt` must still write frontmatter
+        // in the order the schema declares.
+        let yaml = "version: 2\nfrontmatter:\n  type: object\n  properties:\n    zebra: {}\n    alpha: {}\n    middle: {}\n";
+        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(td.frontmatter_field_order(), ["zebra", "alpha", "middle"]);
+    }
+
+    /// A v1 body under a v2 header: serde would ignore the unknown `fields:`
+    /// key and the type would enforce nothing.  The tombstone catches it.
+    #[test]
+    fn test_v2_rejects_fields() {
+        let yaml = "version: 2\nfields:\n  name:\n    type: string\nfrontmatter:\n  type: object\n";
+        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
+        let err = td.validate("note").unwrap_err().to_string();
+        assert!(err.contains("removed version 1 spelling"), "{err}");
+    }
+
+    #[test]
+    fn test_unsupported_version_rejected() {
+        let td: TypeDef = serde_yaml::from_str("version: 99\n").unwrap();
+        let err = td.validate("note").unwrap_err().to_string();
+        assert!(err.contains("unsupported schema version 99"), "{err}");
+    }
+
+    #[test]
+    fn test_v2_invalid_json_schema_rejected() {
+        // `required` must be an array of strings, not a string.
+        let yaml = "version: 2\nfrontmatter:\n  type: object\n  required: ticker\n";
+        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
+        assert!(td.validate("security").is_err());
+    }
+
+    #[test]
+    fn test_v2_without_frontmatter_is_valid() {
+        let yaml = "version: 2\nstructure:\n  title: from_filename\n";
+        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
+        td.validate("note").unwrap();
+        assert!(td.frontmatter_validator().unwrap().is_none());
+    }
+
+    /// The stale-preset case: a schema dir holding one unversioned file fails
+    /// to load rather than silently contributing a type that checks nothing.
+    #[test]
+    fn test_schema_load_rejects_unversioned_schema() {
+        let dir = TempDir::new().unwrap();
+        let schema_dir = dir.path().join(".typedown");
+        fs::create_dir(&schema_dir).unwrap();
+
+        fs::write(
+            schema_dir.join("note.yaml"),
+            "fields:\n  priority:\n    type: integer\n",
+        )
+        .unwrap();
+
+        let err = format!("{:#}", Schema::load(&schema_dir).unwrap_err());
+        assert!(err.contains("missing 'version: 2'"), "{err}");
+    }
+
+    #[test]
+    fn test_schema_load_rejects_v2_with_fields() {
+        let dir = TempDir::new().unwrap();
+        let schema_dir = dir.path().join(".typedown");
+        fs::create_dir(&schema_dir).unwrap();
+        fs::write(
+            schema_dir.join("broken.yaml"),
+            "version: 2\nfields:\n  name:\n    type: string\n",
+        )
+        .unwrap();
+        assert!(Schema::load(&schema_dir).is_err());
+    }
+
+    #[test]
+    fn test_builtin_presets_match_the_published_meta_schema() {
+        let meta: serde_json::Value =
+            serde_json::from_str(META_SCHEMA).expect("schema.json is valid json");
+        let validator = jsonschema::validator_for(&meta).expect("schema.json compiles");
+
+        for (name, content) in BUILTIN_PRESETS {
+            let yaml: serde_yaml::Value = serde_yaml::from_str(content).unwrap();
+            let instance: serde_json::Value = serde_yaml::from_value(yaml).unwrap();
+            let errors: Vec<String> = validator
+                .iter_errors(&instance)
+                .map(|e| format!("{}: {e}", e.instance_path()))
+                .collect();
+            assert!(errors.is_empty(), "preset '{name}': {errors:?}");
+        }
+    }
+
+    /// Presets are the schemas every project inherits, so each must declare
+    /// the one live version and compile its `frontmatter:`.
+    #[test]
+    fn test_builtin_presets_are_all_version_2() {
+        for (name, content) in BUILTIN_PRESETS {
+            let td: TypeDef =
+                serde_yaml::from_str(content).unwrap_or_else(|e| panic!("preset {name}: {e}"));
+            assert_eq!(td.version, 2, "preset '{name}' should be version 2");
+            td.validate(name)
+                .unwrap_or_else(|e| panic!("preset {name} should be a valid type def: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn test_meta_schema_requires_version_2() {
+        let meta: serde_json::Value = serde_json::from_str(META_SCHEMA).unwrap();
+        let validator = jsonschema::validator_for(&meta).unwrap();
+
+        let with_fields = serde_json::json!({"version": 2, "fields": {}});
+        assert!(!validator.is_valid(&with_fields));
+
+        let unversioned = serde_json::json!({"frontmatter": {"type": "object"}});
+        assert!(!validator.is_valid(&unversioned));
+
+        let v1 = serde_json::json!({"version": 1});
+        assert!(!validator.is_valid(&v1));
+
+        let good_v2 = serde_json::json!({"version": 2, "frontmatter": {"type": "object"}});
+        assert!(validator.is_valid(&good_v2));
+    }
+
+    // ── Correspondence ────────────────────────────────────────────────────────
+
+    /// Every rule shape, as `schema-authoring.md` documents them.
+    const CORRESPONDENCE_YAML: &str = "\
+version: 2
+correspondence:
+  - each: frontmatter.files[]
+    requires:
+      subsection-under: \"## Files\"
+      heading: \"### {quality}\"
+  - each: subsections-under \"## Files\"
+    requires:
+      frontmatter-item: files[].quality
+  - each: frontmatter.species[]
+    requires:
+      link-in: \"## Species\"
+      target_type: species
+  - each: links-in-section \"## Species\"
+    requires:
+      frontmatter-item: species[]
+  - each: frontmatter.location
+    requires:
+      link-in: \"## Location\"
+  - each: links-in-section \"## Cast\"
+    requires:
+      target_type: personality
+      backlink-in: \"## Movies\"
+  - each: docs-of-type tvseason in-directory \".\"
+    requires:
+      link-in: \"## Seasons\"
+";
+
+    #[test]
+    fn test_correspondence_rules_load_on_a_v2_schema() {
+        let td: TypeDef = serde_yaml::from_str(CORRESPONDENCE_YAML).unwrap();
+        td.validate("movie").unwrap();
+        assert_eq!(td.correspondence.len(), 7);
+    }
+
+    #[test]
+    fn test_correspondence_defaults_to_empty() {
+        let td: TypeDef = serde_yaml::from_str("version: 2\n").unwrap();
+        assert!(td.correspondence.is_empty());
+    }
+
+    #[test]
+    fn test_schema_load_rejects_a_malformed_correspondence_rule() {
+        let dir = TempDir::new().unwrap();
+        let schema_dir = dir.path().join(SCHEMA_DIR);
+        fs::create_dir(&schema_dir).unwrap();
+        fs::write(
+            schema_dir.join("movie.yaml"),
+            "version: 2\ncorrespondence:\n  - each: frontmatter.files[]\n    requires:\n      target_type: personality\n",
+        )
+        .unwrap();
+        let err = Schema::load(&schema_dir).unwrap_err().to_string();
+        assert!(err.contains("invalid schema"), "{err}");
+    }
+
+    #[test]
+    fn test_meta_schema_accepts_the_documented_correspondence_rules() {
+        let meta: serde_json::Value = serde_json::from_str(META_SCHEMA).unwrap();
+        let validator = jsonschema::validator_for(&meta).unwrap();
+
+        let yaml: serde_yaml::Value = serde_yaml::from_str(CORRESPONDENCE_YAML).unwrap();
+        let instance: serde_json::Value = serde_yaml::from_value(yaml).unwrap();
+        let errors: Vec<String> = validator
+            .iter_errors(&instance)
+            .map(|e| format!("{}: {e}", e.instance_path()))
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn test_meta_schema_rejects_correspondence_on_v1_and_unknown_selectors() {
+        let meta: serde_json::Value = serde_json::from_str(META_SCHEMA).unwrap();
+        let validator = jsonschema::validator_for(&meta).unwrap();
+
+        let v1 = serde_json::json!({
+            "correspondence": [{"each": "frontmatter.files[]", "requires": {"subsection-under": "## Files"}}],
+        });
+        assert!(!validator.is_valid(&v1), "'correspondence' needs version 2");
+
+        let bogus_selector = serde_json::json!({
+            "version": 2,
+            "correspondence": [{"each": "wibbles-under \"## Files\"", "requires": {"target_type": "movie"}}],
+        });
+        assert!(!validator.is_valid(&bogus_selector));
+
+        let bogus_key = serde_json::json!({
+            "version": 2,
+            "correspondence": [{"each": "frontmatter.files[]", "requires": {"subsection_under": "## Files"}}],
+        });
+        assert!(
+            !validator.is_valid(&bogus_key),
+            "underscore spelling is not a key"
+        );
+
+        let unscoped = serde_json::json!({
+            "version": 2,
+            "correspondence": [{"each": "docs-of-type tvseason", "requires": {"link-in": "## Seasons"}}],
+        });
+        assert!(
+            !validator.is_valid(&unscoped),
+            "'docs-of-type' has to say where to look"
+        );
+
+        let absolute_scope = serde_json::json!({
+            "version": 2,
+            "correspondence": [{"each": "docs-of-type tvseason in-directory \"/shows\"", "requires": {"link-in": "## Seasons"}}],
+        });
+        assert!(
+            !validator.is_valid(&absolute_scope),
+            "the scope is relative to the document"
+        );
     }
 
     // ── FieldDef validation ───────────────────────────────────────────────────
 
+    /// `FieldDef` survives only inside a section's `properties:`, so that is
+    /// where its internal-consistency rules are exercised.
+    fn props_type(body: &str) -> TypeDef {
+        let yaml = format!(
+            "version: 2\nstructure:\n  sections:\n    - title: Parts\n      properties:\n{body}"
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
     #[test]
     fn test_enum_without_values_fails() {
-        let yaml = "fields:\n  status:\n    type: enum\n";
-        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
-        assert!(td.validate("test").is_err());
+        assert!(props_type("        status:\n          type: enum\n")
+            .validate("test")
+            .is_err());
     }
 
     #[test]
     fn test_enum_with_empty_values_fails() {
-        let yaml = "fields:\n  status:\n    type: enum\n    values: []\n";
-        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
-        assert!(td.validate("test").is_err());
+        assert!(
+            props_type("        status:\n          type: enum\n          values: []\n")
+                .validate("test")
+                .is_err()
+        );
     }
 
     #[test]
     fn test_enum_with_values_ok() {
-        let yaml = "fields:\n  status:\n    type: enum\n    values: [a, b]\n";
-        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
-        assert!(td.validate("test").is_ok());
+        assert!(
+            props_type("        status:\n          type: enum\n          values: [a, b]\n")
+                .validate("test")
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_list_of_enum_without_values_fails() {
-        let yaml = "fields:\n  tags:\n    type: list\n    item_type: enum\n";
-        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
-        assert!(td.validate("test").is_err());
+        assert!(
+            props_type("        tags:\n          type: list\n          item_type: enum\n")
+                .validate("test")
+                .is_err()
+        );
     }
 
     #[test]
     fn test_list_of_string_ok() {
-        let yaml = "fields:\n  names:\n    type: list\n    item_type: string\n";
-        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
-        assert!(td.validate("test").is_ok());
+        assert!(
+            props_type("        names:\n          type: list\n          item_type: string\n")
+                .validate("test")
+                .is_ok()
+        );
     }
 
     // ── StructureDef ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_structure_defaults() {
-        let yaml = "description: foo\n";
+        let yaml = "version: 2\ndescription: foo\n";
         let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(td.structure.title, TitleMode::None);
         assert!(td.structure.strict_sections);
@@ -868,10 +1480,7 @@ fields:
     #[test]
     fn test_structure_all_fields_from_yaml() {
         let yaml = r#"
-fields:
-  category:
-    type: string
-    required: true
+version: 2
 structure:
   title: from_filename
   strict_sections: false
@@ -879,16 +1488,17 @@ structure:
   sections:
     - title: Notes
       required: false
-      bullets: any
+      bullets: unordered
 "#;
         let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(td.structure.title, TitleMode::FromFilename);
         assert!(!td.structure.strict_sections);
         assert_eq!(td.structure.size_warning, Some(4000));
-        assert_eq!(td.fields.len(), 1);
-        assert!(td.fields["category"].required);
         assert_eq!(td.structure.sections.len(), 1);
-        assert_eq!(td.structure.sections[0].bullets, Some(BulletMode::Any));
+        assert_eq!(
+            td.structure.sections[0].bullets,
+            Some(BulletMode::Unordered)
+        );
     }
 
     #[test]
@@ -913,22 +1523,55 @@ structure:
         let mc = sec.managed_content.as_ref().unwrap();
         assert!(mc.template.contains("## Related Documents"));
         assert_eq!(mc.migrate_from, ["Journal", "Roadmap"]);
+        // Preserving what the template doesn't declare is the default; the
+        // clobbering behaviour has to be asked for.
+        assert_eq!(mc.merge, MergeMode::Upsert);
     }
 
     #[test]
-    fn test_intro_text_from_yaml() {
-        let yaml = r#"
-structure:
-  sections:
-    - title: Non-Goals
-      required: true
-      intro_text: "Explicitly out of scope to keep the project focused:"
-"#;
+    fn test_managed_content_merge_mode_from_yaml() {
+        let yaml = "structure:\n  sections:\n    - title: Related\n      managed_content:\n        template: \"## Related\\n\"\n        merge: replace\n";
         let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
-        let sec = &td.structure.sections[0];
-        assert_eq!(
-            sec.intro_text.as_deref(),
-            Some("Explicitly out of scope to keep the project focused:")
+        let mc = td.structure.sections[0].managed_content.as_ref().unwrap();
+        assert_eq!(mc.merge, MergeMode::Replace);
+    }
+
+    #[test]
+    fn test_meta_schema_allows_managed_content_merge() {
+        // `managed_content` is `additionalProperties: false`, so a knob the
+        // engine understands but schema.json doesn't is unusable in YAML.
+        let meta: serde_json::Value = serde_json::from_str(META_SCHEMA).unwrap();
+        let validator = jsonschema::validator_for(&meta).unwrap();
+
+        for mode in ["upsert", "replace"] {
+            let instance = serde_json::json!({
+                "version": 2,
+                "structure": {
+                    "sections": [{
+                        "title": "Related",
+                        "managed_content": {"template": "## Related\n", "merge": mode},
+                    }],
+                }
+            });
+            let errors: Vec<String> = validator
+                .iter_errors(&instance)
+                .map(|e| format!("{}: {e}", e.instance_path()))
+                .collect();
+            assert!(errors.is_empty(), "merge: {mode}: {errors:?}");
+        }
+
+        let bogus = serde_json::json!({
+            "version": 2,
+            "structure": {
+                "sections": [{
+                    "title": "Related",
+                    "managed_content": {"template": "## Related\n", "merge": "clobber"},
+                }],
+            }
+        });
+        assert!(
+            !validator.is_valid(&bogus),
+            "an unknown merge mode must be rejected"
         );
     }
 
@@ -936,28 +1579,24 @@ structure:
 
     #[test]
     fn test_bullet_mode_string_values() {
-        let yaml = "structure:\n  sections:\n    - title: A\n      bullets: any\n    - title: B\n      bullets: ordered\n    - title: C\n      bullets: unordered\n";
+        let yaml = "structure:\n  sections:\n    - title: B\n      bullets: ordered\n    - title: C\n      bullets: unordered\n";
         let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(td.structure.sections[0].bullets, Some(BulletMode::Any));
-        assert_eq!(td.structure.sections[1].bullets, Some(BulletMode::Ordered));
+        assert_eq!(td.structure.sections[0].bullets, Some(BulletMode::Ordered));
         assert_eq!(
-            td.structure.sections[2].bullets,
+            td.structure.sections[1].bullets,
             Some(BulletMode::Unordered)
         );
     }
 
+    /// `any` and its `true` shorthand were removed: a section that accepts both
+    /// list types is what omitting `bullets` already means.
     #[test]
-    fn test_bullet_mode_true_is_any() {
-        let yaml = "structure:\n  sections:\n    - title: A\n      bullets: true\n";
-        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(td.structure.sections[0].bullets, Some(BulletMode::Any));
-    }
-
-    #[test]
-    fn test_bullet_mode_false_rejected() {
-        let yaml = "structure:\n  sections:\n    - title: A\n      bullets: false\n";
-        let result: Result<TypeDef, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_err(), "bullets: false should be rejected");
+    fn test_bullet_mode_any_rejected() {
+        for value in ["any", "true", "false"] {
+            let yaml = format!("structure:\n  sections:\n    - title: A\n      bullets: {value}\n");
+            let result: Result<TypeDef, _> = serde_yaml::from_str(&yaml);
+            assert!(result.is_err(), "bullets: {value} should be rejected");
+        }
     }
 
     #[test]
@@ -1005,13 +1644,6 @@ structure:
     }
 
     #[test]
-    fn test_title_mode_from_project() {
-        let yaml = "structure:\n  title: from_project\n";
-        let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(td.structure.title, TitleMode::FromProject);
-    }
-
-    #[test]
     fn test_title_mode_required() {
         let yaml = "structure:\n  title: required\n";
         let td: TypeDef = serde_yaml::from_str(yaml).unwrap();
@@ -1038,12 +1670,12 @@ structure:
 
         fs::write(
             schema_dir.join("recipe.yaml"),
-            "description: A recipe\nfields:\n  servings:\n    type: integer\n",
+            "version: 2\ndescription: A recipe\nfrontmatter:\n  type: object\n  properties:\n    servings:\n      type: integer\n",
         )
         .unwrap();
         fs::write(
             schema_dir.join("note.yaml"),
-            "description: A note\nfields:\n  tags:\n    type: list\n    item_type: string\n",
+            "version: 2\ndescription: A note\nfrontmatter:\n  type: object\n  properties:\n    tags:\n      type: array\n      items:\n        type: string\n",
         )
         .unwrap();
 
@@ -1060,7 +1692,11 @@ structure:
         let schema_dir = dir.path().join(".typedown");
         fs::create_dir(&schema_dir).unwrap();
 
-        fs::write(schema_dir.join("recipe.yaml"), "description: A recipe\n").unwrap();
+        fs::write(
+            schema_dir.join("recipe.yaml"),
+            "version: 2\ndescription: A recipe\n",
+        )
+        .unwrap();
         fs::write(schema_dir.join("README.md"), "# Schemas\n").unwrap();
         fs::write(schema_dir.join("notes.txt"), "some notes\n").unwrap();
 
@@ -1074,7 +1710,7 @@ structure:
         let schema_dir = dir.path().join(".typedown");
         fs::create_dir(&schema_dir).unwrap();
 
-        fs::write(schema_dir.join("bad.yaml"), "fields: [\ninvalid yaml").unwrap();
+        fs::write(schema_dir.join("bad.yaml"), "paths: [\ninvalid yaml").unwrap();
 
         assert!(Schema::load(&schema_dir).is_err());
     }
@@ -1088,7 +1724,7 @@ structure:
         // enum without values fails validate()
         fs::write(
             schema_dir.join("broken.yaml"),
-            "fields:\n  status:\n    type: enum\n",
+            "version: 2\nstructure:\n  sections:\n    - title: Parts\n      properties:\n        status:\n          type: enum\n",
         )
         .unwrap();
 
@@ -1182,6 +1818,84 @@ structure:
         assert!(segs
             .iter()
             .any(|s| matches!(s, TemplateSegment::Literal(_))));
+    }
+
+    // ── vacuous template lint ─────────────────────────────────────────────────
+
+    /// The real case that motivated the lint: a journal schema whose template
+    /// read like guidance but compiled to `- ` + wildcard, matching every item.
+    #[test]
+    fn test_vacuous_template_prose_only() {
+        let yaml = "structure:\n  sections:\n    - title: Notes\n      template: '- Fact or impression about the movie'\n";
+        let mut schema = Schema::default();
+        schema
+            .types
+            .insert("movie".to_string(), serde_yaml::from_str(yaml).unwrap());
+
+        let lints = schema.vacuous_templates();
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].type_name, "movie");
+        assert_eq!(lints[0].section, "Notes");
+        assert_eq!(lints[0].template, "- Fact or impression about the movie");
+    }
+
+    #[test]
+    fn test_vacuous_template_intro_section() {
+        let yaml = "structure:\n  intro:\n    template: '- Text'\n";
+        let mut schema = Schema::default();
+        schema
+            .types
+            .insert("note".to_string(), serde_yaml::from_str(yaml).unwrap());
+
+        let lints = schema.vacuous_templates();
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].section, "intro");
+    }
+
+    /// Anything that pins down part of the item — bold, a link, a date, or a
+    /// separator literal — makes the template do real work.
+    #[test]
+    fn test_constraining_templates_not_vacuous() {
+        for template in [
+            "- **Text**: Text",
+            "- [text](url) - Text",
+            "- YYYY-MM-DD - Text",
+            "- Text, Text",
+        ] {
+            let yaml =
+                format!("structure:\n  sections:\n    - title: S\n      template: '{template}'\n");
+            let mut schema = Schema::default();
+            schema
+                .types
+                .insert("t".to_string(), serde_yaml::from_str(&yaml).unwrap());
+            assert!(
+                schema.vacuous_templates().is_empty(),
+                "template {template:?} should not be flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_template_is_not_vacuous() {
+        let yaml = "structure:\n  sections:\n    - title: S\n      bullets: unordered\n";
+        let mut schema = Schema::default();
+        schema
+            .types
+            .insert("t".to_string(), serde_yaml::from_str(yaml).unwrap());
+        assert!(schema.vacuous_templates().is_empty());
+    }
+
+    /// Built-in presets ship as examples, so they must pass their own lint.
+    #[test]
+    fn test_builtin_presets_have_no_vacuous_templates() {
+        let mut schema = Schema::default();
+        for (name, content) in BUILTIN_PRESETS {
+            schema.types.insert(
+                (*name).to_string(),
+                serde_yaml::from_str(content).expect("preset parses"),
+            );
+        }
+        assert_eq!(schema.vacuous_templates(), vec![]);
     }
 
     // ── paths field deserialization ───────────────────────────────────────────
@@ -1318,7 +2032,7 @@ structure:
 
         fs::write(
             schema_dir.join("command.yaml"),
-            "paths:\n  - \".claude/commands/*.md\"\nstructure:\n  title: required\n",
+            "version: 2\npaths:\n  - \".claude/commands/*.md\"\nstructure:\n  title: required\n",
         )
         .unwrap();
 
@@ -1363,6 +2077,75 @@ structure:
         assert!(matcher.match_path("journal/notes.md").is_empty());
     }
 
+    // ── Built-in preset path patterns ────────────────────────────────────────
+
+    fn builtin_matcher() -> PathMatcher {
+        let mut schema = Schema::default();
+        for (name, content) in BUILTIN_PRESETS {
+            let td: TypeDef = serde_yaml::from_str(content)
+                .unwrap_or_else(|e| panic!("preset {name} should parse: {e}"));
+            schema.types.insert((*name).to_string(), td);
+        }
+        schema.build_path_matcher().unwrap()
+    }
+
+    #[test]
+    fn test_root_document_presets_do_not_claim_nested_files() {
+        // Regression: `paths: ["**/README.md"]` plus `title: from_directory`
+        // claimed every nested README and renamed its H1 after the containing
+        // directory — a nested README titled `# TSM mats groups` lost its
+        // heading and became `# tsm`. Singleton project documents anchor at
+        // the schema root.
+        let matcher = builtin_matcher();
+
+        assert_eq!(matcher.match_path("README.md"), vec!["readme"]);
+        assert_eq!(matcher.match_path("GOALS.md"), vec!["goals"]);
+        assert_eq!(matcher.match_path("ROADMAP.md"), vec!["roadmap"]);
+
+        for nested in [
+            "tsm/README.md",
+            "docs/deep/README.md",
+            "tsm/GOALS.md",
+            "docs/ROADMAP.md",
+        ] {
+            assert!(
+                matcher.match_path(nested).is_empty(),
+                "{nested} should not be claimed by a root-document preset"
+            );
+        }
+    }
+
+    #[test]
+    fn test_agents_preset_still_claims_nested_instruction_files() {
+        // AGENTS.md / CLAUDE.md are a per-directory convention and the preset
+        // has `title: none`, so there is no H1 for it to overwrite.
+        let matcher = builtin_matcher();
+        assert_eq!(matcher.match_path("CLAUDE.md"), vec!["agents"]);
+        assert_eq!(matcher.match_path("src/AGENTS.md"), vec!["agents"]);
+    }
+
+    #[test]
+    fn test_agents_preset_confines_related_documents_to_the_root() {
+        // The glob stays recursive so nested instruction files keep the size
+        // warning, but the Related Documents template names project-root paths
+        // (README.md, GOALS.md, tasks/, journal/) — wrong for a nested file.
+        let (_, content) = BUILTIN_PRESETS
+            .iter()
+            .find(|(name, _)| *name == "agents")
+            .expect("agents preset should exist");
+        let td: TypeDef = serde_yaml::from_str(content).expect("agents preset should parse");
+
+        let managed = td
+            .structure
+            .sections
+            .iter()
+            .find(|s| s.title == "Related Documents")
+            .and_then(|s| s.managed_content.as_ref())
+            .expect("Related Documents should be managed");
+
+        assert_eq!(managed.scope, ManagedScope::Root);
+    }
+
     // ── presets_dir ───────────────────────────────────────────────────────────
 
     #[test]
@@ -1382,6 +2165,32 @@ structure:
         assert_eq!(result, None);
     }
 
+    /// A stale v1 schema in `~/.config/typedown/presets/` is the file the
+    /// version requirement exists for, and the one nothing else would mention:
+    /// it sits outside the project, so no document names it.  Preset loading
+    /// used to swallow the failure and quietly hand back the built-in of the
+    /// same name, which is a project judged by a schema nobody wrote.
+    #[test]
+    fn test_broken_xdg_preset_is_reported_not_swallowed() {
+        let dir = TempDir::new().unwrap();
+        let presets = dir.path().join("typedown/presets");
+        fs::create_dir_all(&presets).unwrap();
+        fs::write(
+            presets.join("readme.yaml"),
+            "paths:\n  - \"**/README.md\"\nfields:\n  owner:\n    type: string\n    required: true\n",
+        )
+        .unwrap();
+
+        let (schema, err) = load_presets_from(Some(presets));
+        let err = format!("{:#}", err.expect("a broken preset must surface its error"));
+        assert!(err.contains("missing 'version: 2'"), "{err}");
+        assert!(
+            schema.unwrap().get_type("readme").is_some(),
+            "the built-in readme still stands in — which is exactly why the \
+             error has to be reported rather than inferred from a missing type"
+        );
+    }
+
     #[test]
     fn test_load_presets_from_xdg() {
         let dir = TempDir::new().unwrap();
@@ -1389,7 +2198,7 @@ structure:
         fs::create_dir_all(&presets).unwrap();
         fs::write(
             presets.join("readme.yaml"),
-            "paths:\n  - \"**/README.md\"\nstructure:\n  title: from_directory\n",
+            "version: 2\npaths:\n  - \"**/README.md\"\nstructure:\n  title: from_directory\n",
         )
         .unwrap();
 

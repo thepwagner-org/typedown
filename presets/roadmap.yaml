@@ -1,11 +1,14 @@
-description: Future possibilities and explicit non-goals for a project.
+version: 2
+description: >-
+  Legacy ROADMAP.md schema, kept so existing files still parse. New work
+  shouldn't introduce ROADMAP.md — goals/non-goals belong in GOALS.md and
+  future ideas belong in tasks/ with `deferred-until:` set.
+
+# Anchored at the schema root: `title: Roadmap` is a fixed H1, so a nested
+# ROADMAP.md would have its own title overwritten with the literal word.
 paths:
-  - "**/ROADMAP.md"
+  - "ROADMAP.md"
 
 structure:
   title: Roadmap
   strict_sections: false
-  sections:
-    - title: Non-Goals
-      required: true
-      intro_text: "Explicitly out of scope to keep the project focused:"

@@ -25,17 +25,12 @@ pub enum Fix {
         section_start: Option<usize>,
         /// Block index of section end (exclusive).
         section_end: usize,
-        /// Template blocks to write into the section.
-        template_blocks: Vec<Block>,
-        /// User-written content appended after the template (preserved).
+        /// Blocks to write into the section: the template, with its lists
+        /// already upserted against what the document had.
+        managed_blocks: Vec<Block>,
+        /// User-written content the template didn't account for (preserved,
+        /// appended after the managed blocks).
         custom_content: Vec<Block>,
-    },
-    /// Insert an intro paragraph into a section.
-    InsertSectionIntro {
-        /// Line number after which to insert (used for display; insertion uses block index).
-        insert_after_line: usize,
-        /// The intro paragraph text.
-        text: String,
     },
     /// Rebuild the document with date entries in the correct sort order.
     SortEntries {
@@ -77,7 +72,6 @@ impl Fix {
             Diagnostic::MissingH1 { .. }
                 | Diagnostic::H1Mismatch { .. }
                 | Diagnostic::ManagedSectionNeedsUpdate { .. }
-                | Diagnostic::SectionNeedsIntro { .. }
                 | Diagnostic::EntriesOutOfOrder { .. }
                 | Diagnostic::EmptyOptionalSection { .. }
                 | Diagnostic::SectionNotBullets { .. }
@@ -103,20 +97,13 @@ impl Fix {
             Diagnostic::ManagedSectionNeedsUpdate {
                 section_start,
                 section_end,
-                template_blocks,
+                managed_blocks,
                 custom_content,
             } => Some(Fix::UpdateManagedSection {
                 section_start: *section_start,
                 section_end: *section_end,
-                template_blocks: template_blocks.clone(),
+                managed_blocks: managed_blocks.clone(),
                 custom_content: custom_content.clone(),
-            }),
-            Diagnostic::SectionNeedsIntro {
-                insert_after_line,
-                text,
-            } => Some(Fix::InsertSectionIntro {
-                insert_after_line: *insert_after_line,
-                text: text.clone(),
             }),
             Diagnostic::EntriesOutOfOrder {
                 preamble,
@@ -178,10 +165,10 @@ impl Fix {
             Fix::UpdateManagedSection {
                 section_start,
                 section_end,
-                template_blocks,
+                managed_blocks,
                 custom_content,
             } => {
-                let mut new_section = template_blocks.clone();
+                let mut new_section = managed_blocks.clone();
                 if !custom_content.is_empty() {
                     new_section.push(Block::BlankLine);
                     new_section.extend(custom_content.clone());
@@ -201,39 +188,6 @@ impl Fix {
                         doc.blocks.extend(new_section);
                     }
                 }
-            }
-
-            Fix::InsertSectionIntro {
-                insert_after_line,
-                text,
-            } => {
-                // Find the block whose line number matches the heading we insert after,
-                // then skip past any immediately-following BlankLine so the paragraph
-                // lands directly before the section content (no extra blank between them).
-                let heading_idx = doc
-                    .blocks
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, b)| b.line() > 0 && b.line() <= *insert_after_line)
-                    .map(|(i, _)| i)
-                    .next_back()
-                    .unwrap_or(0);
-
-                // Skip over a BlankLine immediately after the heading.
-                let insert_idx =
-                    if matches!(doc.blocks.get(heading_idx + 1), Some(Block::BlankLine)) {
-                        heading_idx + 2
-                    } else {
-                        heading_idx + 1
-                    };
-
-                doc.blocks.insert(
-                    insert_idx,
-                    Block::Paragraph {
-                        content: vec![Inline::Text(text.clone())],
-                        line: 0,
-                    },
-                );
             }
 
             Fix::SortEntries {
@@ -263,24 +217,45 @@ impl Fix {
                 paragraph_indices,
                 ordered,
             } => {
-                // Convert in reverse order to preserve earlier indices.
                 let mut indices = paragraph_indices.clone();
                 indices.sort_unstable();
-                for idx in indices.into_iter().rev() {
-                    if idx >= doc.blocks.len() {
-                        continue;
-                    }
-                    if let Block::Paragraph { content, line } = &doc.blocks[idx] {
-                        let item = ListItem {
-                            content: content.clone(),
-                            children: vec![],
-                        };
-                        doc.blocks[idx] = Block::List {
-                            items: vec![item],
+                indices.retain(|&i| matches!(doc.blocks.get(i), Some(Block::Paragraph { .. })));
+                // Convert a run at a time, in reverse order to preserve earlier
+                // indices. Paragraphs with nothing but blank lines between them
+                // become items of one list rather than a list apiece: adjacent
+                // lists have to be written with different markers to stay
+                // adjacent, and a section of bullets that alternates `-` and `*`
+                // is not what "convert to bullets" was asked for.
+                for run in paragraph_runs(&doc.blocks, &indices).into_iter().rev() {
+                    let last = *run.last().expect("runs are never empty");
+                    let items = run
+                        .iter()
+                        .map(|&i| ListItem {
+                            content: match &doc.blocks[i] {
+                                Block::Paragraph { content, .. } => content.clone(),
+                                _ => unreachable!("runs hold paragraph indices"),
+                            },
+                            // The blank line that separated the paragraphs is
+                            // what keeps the list loose, so each item but the
+                            // last carries it into the list.
+                            children: if i == last {
+                                vec![]
+                            } else {
+                                vec![Block::BlankLine]
+                            },
+                        })
+                        .collect();
+                    let start_idx = run[0];
+                    let line = doc.blocks[start_idx].line();
+                    doc.blocks.splice(
+                        start_idx..=last,
+                        [Block::List {
+                            items,
                             ordered: *ordered,
-                            line: *line,
-                        };
-                    }
+                            start: 1,
+                            line,
+                        }],
+                    );
                 }
             }
 
@@ -307,6 +282,26 @@ impl Fix {
             }
         }
     }
+}
+
+/// Group sorted block indices into runs separated by nothing but blank lines.
+///
+/// Two paragraphs with a gap between them are still neighbours; one with a
+/// heading or a table in between is not, and the two belong to different lists.
+fn paragraph_runs(blocks: &[Block], indices: &[usize]) -> Vec<Vec<usize>> {
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    for &idx in indices {
+        let adjacent = runs.last().and_then(|run| run.last()).is_some_and(|&prev| {
+            blocks[prev + 1..idx]
+                .iter()
+                .all(|b| matches!(b, Block::BlankLine))
+        });
+        match runs.last_mut() {
+            Some(run) if adjacent => run.push(idx),
+            _ => runs.push(vec![idx]),
+        }
+    }
+    runs
 }
 
 // ── Content fixes (paragraph ↔ bullet conversion) ────────────────────────────
@@ -457,7 +452,7 @@ mod tests {
             &[Diagnostic::ManagedSectionNeedsUpdate {
                 section_start: None,
                 section_end: 0, // unused when appending
-                template_blocks: template_doc.blocks.clone(),
+                managed_blocks: template_doc.blocks.clone(),
                 custom_content: vec![],
             }],
         );
@@ -484,7 +479,7 @@ mod tests {
             &[Diagnostic::ManagedSectionNeedsUpdate {
                 section_start: Some(section_start),
                 section_end,
-                template_blocks: template_doc.blocks.clone(),
+                managed_blocks: template_doc.blocks.clone(),
                 custom_content: vec![],
             }],
         );
@@ -643,6 +638,36 @@ mod tests {
         let result = serialize(&doc);
         assert!(result.contains("- First paragraph."), "got: {result}");
         assert!(result.contains("- Second paragraph."), "got: {result}");
+    }
+
+    #[test]
+    fn test_paragraphs_converted_to_bullets_form_one_list() {
+        // The bullets fix used to make a list per paragraph and lean on the
+        // serializer's adjacent-list merge to weld them; now it builds the list
+        // it means, and the serialized output says so.
+        let mut doc = parse("## Goals\n\nFirst.\n\nSecond.\n");
+        let diags: Vec<_> = doc
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph { line, .. } => Some(Diagnostic::SectionNotBullets {
+                    line: *line,
+                    context: "section 'Goals'".to_string(),
+                }),
+                _ => None,
+            })
+            .collect();
+        apply_fixes(&mut doc, &diags);
+        assert_eq!(
+            doc.blocks
+                .iter()
+                .filter(|b| matches!(b, Block::List { .. }))
+                .count(),
+            1,
+            "expected one list: {:?}",
+            doc.blocks
+        );
+        assert_eq!(serialize(&doc), "## Goals\n\n- First.\n\n- Second.\n");
     }
 
     // ── ConvertListType ───────────────────────────────────────────────────────

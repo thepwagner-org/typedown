@@ -1,0 +1,31 @@
+version: 2
+description: >-
+  Project goals and non-goals. The non-goals list is the durable record of
+  "we've considered this and rejected it"; future ideas go in tasks/ with
+  `deferred-until:`, not here.
+
+# Anchored at the schema root for the same reason as readme.yaml:
+# `title: from_directory` would rename a nested GOALS.md after its directory.
+paths:
+  - "GOALS.md"
+
+structure:
+  title: from_directory
+  strict_sections: false
+  # do not write an introduction
+  sections:
+    - title: Goals
+      required: true
+      bullets: unordered
+      description: >-
+        What this project is committed to achieving. One bullet per concrete
+        outcome. Aspirational items that aren't yet committed belong in
+        tasks/ with `deferred-until:`, not here.
+    - title: Non-Goals
+      required: true
+      bullets: unordered
+      description: >-
+        The durable record of considered-and-rejected ideas. Each bullet
+        names one thing this project deliberately won't do, ideally with a
+        short reason. Keeps future agents (and humans) from re-litigating
+        settled decisions.
